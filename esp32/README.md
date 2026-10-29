@@ -1,0 +1,61 @@
+# wheeltop_pod: эмулятор шифтера WHEELTOP на ESP32
+
+Плата ESP32 притворяется подом (шифтером на руле) по BLE и при этом рекламирует полную
+manufacturer data. Мак так не умеет. Мак управляет платой по USB через `../mac/wheeltop-shifter --esp32`.
+
+Подходит любая плата с Bluetooth LE: ESP32, ESP32-C3, ESP32-S3 (ESP32-S2 не подходит, у него нет Bluetooth).
+
+Без компьютера, с кнопками и аккумулятором: см. [WIRING.md](WIRING.md) (ESP32-C3 SuperMini).
+
+## Прошивка
+
+```sh
+arduino-cli lib install NimBLE-Arduino
+arduino-cli compile --fqbn esp32:esp32:esp32 wheeltop_pod
+arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX wheeltop_pod
+```
+
+Для C3 и S3 нужен `--fqbn esp32:esp32:esp32c3` и `esp32:esp32:esp32s3` соответственно.
+
+### ESP32-C3 (проверено на этой плате)
+
+Нужен `CDCOnBoot=cdc`, иначе плата молчит в USB. Обычная прошивка падает с «Failed to start stub flasher»,
+поэтому шьём без stub:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --output-dir build wheeltop_pod
+ESPTOOL=$(ls -d ~/Library/Arduino15/packages/esp32/tools/esptool_py/*/ | tail -1)esptool
+$ESPTOOL --chip esp32c3 --port /dev/cu.usbmodem101 --no-stub write-flash 0x0 build/wheeltop_pod.ino.merged.bin
+```
+
+Полная прошивка (`0x0`, merged) стирает настройки. Для обновления без потери адреса шей только приложение:
+`write-flash 0x10000 build/wheeltop_pod.ino.bin`.
+
+## Порядок проверки
+
+1. `../mac/wheeltop-shifter --esp32`
+2. Включить **настоящий** под и нажать `s`: плата найдёт его и покажет адрес, тип адреса и точные байты рекламы.
+3. Ввести `:clone 1` и нажать Enter. Плата скопирует адрес и рекламу пода и перезагрузится.
+4. **Убрать настоящий под** подальше от велосипеда (другая комната) или вынуть из него батарейку. Разбудить переключатель (RD).
+5. Ждать в логе `Подключился central …` и `Подписка на …0003`. Потом стрелками переключать передачи.
+
+Если RD что-то пишет поду, в логе будет `ЗАПИСЬ от RD -> …`. Эти байты нужны, чтобы доработать протокол.
+Если под TX-типа, плата раз в секунду шлёт статус-кадр, и ответ RD тоже виден в логе.
+
+## Команды платы
+
+Набираются после `:` в `wheeltop-shifter` или в любом serial-мониторе на 115200.
+
+| Команда | Что делает |
+|---|---|
+| `u` / `d` | передача вверх / вниз |
+| `f` | fine-tune вкл/выкл |
+| `s` / `a` | скан 5 с: поды WHEELTOP / все устройства |
+| `clone N` | скопировать адрес и рекламу устройства N из скана |
+| `type ox\|tx-front\|tx-left\|tx-right` | сменить тип пода |
+| `mac AA:BB:CC:DD:EE:FF [public\|random]`, `mac off` | задать свой BLE-адрес |
+| `raw 04 02 06` | отправить произвольный кадр |
+| `reset` | сбросить настройки |
+| `info` | текущие настройки |
+
+Настройки хранятся во флеше платы и переживают перезагрузку.

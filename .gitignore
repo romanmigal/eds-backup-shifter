@@ -1,0 +1,10 @@
+# Сборка
+esp32/wheeltop_pod/build/
+mac/wheeltop-shifter
+
+# Журналы опытов
+*.log
+
+# Настройки Obsidian и macOS
+.obsidian/
+.DS_Store
