@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Читает свисток с прошивкой dongle/sniffer, печатает ATT и пишет .pcap для Wireshark.
 
-    python3 dongle_sniff.py [ПОРТ] [ФАЙЛ.pcap]
+    python3 dongle_sniff.py [ПОРТ] [ФАЙЛ.pcap] [ЦЕЛЬ]
+
+ЦЕЛЬ — адрес устройства, за чьими соединениями следить (по умолчанию шифтер c0:00:00:00:00:01).
+Для переключателя: e0:00:00:00:00:03, тогда central — телефон, peripheral — переключатель.
 
 Без порта берёт первый /dev/cu.usbmodem*, который отвечает строкой "# alive".
 Ctrl+C — остановить. Рядом с .pcap пишется .txt со всеми строками свистка.
@@ -104,11 +107,15 @@ def describe(aa, pdu, role):
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
     out = sys.argv[2] if len(sys.argv) > 2 else time.strftime("dongle-%Y%m%d-%H%M%S.pcap")
+    target = sys.argv[3].lower() if len(sys.argv) > 3 else None
+    central, periph = ("RD ->", "   <- POD") if not target or target.startswith("c6:d5") else ("PHONE ->", "   <- RD")
     if port:
         fd = open_port(port)
     else:
         port, fd = find_port()
     print("Свисток на", port, "| пишу", out)
+    if target:
+        os.write(fd, ("t " + target.replace(":", "") + "\n").encode())
 
     pcap = open(out, "wb")
     pcap.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 256))  # DLT_BLUETOOTH_LE_LL_WITH_PHDR
@@ -151,7 +158,7 @@ def main():
                 event_seen[key] = n + 1
                 if len(event_seen) > 5000:
                     event_seen.clear()
-                role = "RD ->" if n % 2 == 0 else "   <- POD"
+                role = central if n % 2 == 0 else periph
             else:
                 role = ""
             d = describe(aa, pdu, role) if crc else None

@@ -16,12 +16,14 @@
 #include "tusb.h"
 #include "nrf.h"
 
-// Адрес шифтера в порядке байтов в эфире (c0:00:00:00:00:01)
-static const uint8_t TARGET[6] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0 };
+// За кем следим, в порядке байтов в эфире. По умолчанию шифтер c0:00:00:00:00:01.
+// Команда с Мака "t e00000000003" (адрес как пишут обычно) меняет цель, например на переключатель.
+static uint8_t TARGET[6] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0 };
 
 #define ADV_AA        0x8E89BED6u
 #define ADV_CRCINIT   0x555555u
-#define PREAMBLE_AA_US 40   // от начала пакета до события ADDRESS на 1M PHY
+// От начала пакета до события ADDRESS: 40 мкс на 1M PHY, 24 мкс на 2M
+static uint32_t preamble_aa_us = 40;
 
 //--------------------------------------------------------------------+
 // Кольцевой буфер пакетов: пишет прерывание радио, читает main
@@ -75,6 +77,7 @@ static struct {
   // отложенные изменения по instant
   bool     chm_pending;  uint16_t chm_instant;  uint8_t chm_new[5];
   bool     upd_pending;  uint16_t upd_instant;  uint32_t upd_interval_us, upd_offset_us, upd_timeout_us;
+  bool     phy_pending;  uint16_t phy_instant;  bool phy_2m;
 } conn;
 
 static volatile bool note_conn, note_scan;
@@ -135,6 +138,13 @@ static void radio_tune(uint8_t ch, uint32_t aa, uint32_t crcinit) {
   NRF_RADIO->TASKS_RXEN = 1;
 }
 
+static void set_phy(bool two_m) {
+  NRF_RADIO->MODE = two_m ? RADIO_MODE_MODE_Ble_2Mbit : RADIO_MODE_MODE_Ble_1Mbit;
+  NRF_RADIO->PCNF0 = (8u << RADIO_PCNF0_LFLEN_Pos) | (1u << RADIO_PCNF0_S0LEN_Pos) |
+                     ((two_m ? RADIO_PCNF0_PLEN_16bit : RADIO_PCNF0_PLEN_8bit) << RADIO_PCNF0_PLEN_Pos);
+  preamble_aa_us = two_m ? 24 : 40;
+}
+
 static void radio_init(void) {
   NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
   NRF_CLOCK->TASKS_HFCLKSTART = 1;
@@ -149,9 +159,8 @@ static void radio_init(void) {
   NRF_PPI->CHENSET = (1u << 26) | (1u << 27);
 
   NRF_RADIO->POWER = 1;
-  NRF_RADIO->MODE = RADIO_MODE_MODE_Ble_1Mbit;
   NRF_RADIO->MODECNF0 = RADIO_MODECNF0_RU_Fast;
-  NRF_RADIO->PCNF0 = (8u << RADIO_PCNF0_LFLEN_Pos) | (1u << RADIO_PCNF0_S0LEN_Pos);
+  set_phy(false);
   NRF_RADIO->PCNF1 = (255u << RADIO_PCNF1_MAXLEN_Pos) | (3u << RADIO_PCNF1_BALEN_Pos) |
                      RADIO_PCNF1_WHITEEN_Msk;
   NRF_RADIO->CRCCNF = 3u | (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
@@ -171,6 +180,7 @@ static void radio_init(void) {
 static void start_scan(void) {
   unschedule();
   state = ST_SCAN;
+  set_phy(false);
   scan_hop_armed = false;
   scan_ch = 37;
   radio_tune(scan_ch, ADV_AA, ADV_CRCINIT);
@@ -234,7 +244,7 @@ static void enter_conn(uint8_t hdr, const uint8_t *p, uint32_t t_end) {
   conn.chan_id = (uint16_t) ((conn.aa >> 16) ^ (conn.aa & 0xFFFF));
   conn.last_unmapped = 0;
   conn.event = 0;
-  conn.chm_pending = conn.upd_pending = false;
+  conn.chm_pending = conn.upd_pending = conn.phy_pending = false;
 
   conn.anchor = t_end + 1250 + win_off * 1250u;
   conn.last_sync = conn.anchor;
@@ -260,6 +270,10 @@ static void conn_next_event(void) {
     conn.anchor += conn.upd_offset_us;
     conn.interval_us = conn.upd_interval_us;
     conn.timeout_us = conn.upd_timeout_us;
+  }
+  if (conn.phy_pending && conn.event == conn.phy_instant) {
+    conn.phy_pending = false;
+    set_phy(conn.phy_2m);
   }
   if (conn.chm_pending && conn.event == conn.chm_instant) {
     conn.chm_pending = false;
@@ -295,6 +309,12 @@ static void conn_ll_control(const uint8_t *pdu) {
       conn.chm_instant = c[6] | (c[7] << 8);
       conn.chm_pending = true;
       break;
+    case 0x18:   // LL_PHY_UPDATE_IND: PHY M->S, PHY S->M, instant. Coded PHY не поддерживаем.
+      if (pdu[1] < 5 || (c[1] == 0 && c[2] == 0)) return;
+      conn.phy_2m = ((c[1] | c[2]) & 0x02) != 0;
+      conn.phy_instant = c[3] | (c[4] << 8);
+      conn.phy_pending = true;
+      break;
     case 0x02:   // LL_TERMINATE_IND: дослушаем до таймаута, это безопасно
       break;
   }
@@ -320,7 +340,7 @@ void RADIO_IRQHandler(void) {
     pk = &ring[h % RING];
     memcpy(pk->data, rxbuf, total);
     pk->len = total;
-    pk->t = t_addr - PREAMBLE_AA_US;
+    pk->t = t_addr - preamble_aa_us;
     pk->ch = cur_ch;
     pk->aa = cur_aa;
     pk->rssi = (uint8_t) NRF_RADIO->RSSISAMPLE;
@@ -349,7 +369,7 @@ void RADIO_IRQHandler(void) {
   } else if (crcok) {
     if (conn.first_in_event) {
       conn.first_in_event = false;
-      conn.anchor = t_addr - PREAMBLE_AA_US;
+      conn.anchor = t_addr - preamble_aa_us;
       conn.last_sync = conn.anchor;
       schedule(conn.anchor + conn.interval_us - margin_us());
     }
@@ -447,9 +467,36 @@ int main(void) {
     }
     tud_cdc_write_flush();
 
-    // Команда с Мака: "r" — бросить соединение и снова искать шифтер
+    // Команды с Мака: "r" — бросить соединение и снова искать цель; "t aabbccddeeff" — новая цель
+    static char cmd[32];
+    static int cmd_len;
     while (tud_cdc_available()) {
-      if (tud_cdc_read_char() == 'r') {
+      char ch = (char) tud_cdc_read_char();
+      if (ch != '\n' && ch != '\r') {
+        if (cmd_len < (int) sizeof cmd - 1) cmd[cmd_len++] = ch;
+        continue;
+      }
+      cmd[cmd_len] = 0;
+      bool rescan = false;
+      if (cmd[0] == 'r') rescan = true;
+      if (cmd[0] == 't') {
+        uint8_t a[6];
+        int n = 0;
+        for (const char *q = cmd + 1; *q && n < 12; q++) {
+          int v = (*q >= '0' && *q <= '9') ? *q - '0' : (*q | 0x20) >= 'a' && (*q | 0x20) <= 'f' ? (*q | 0x20) - 'a' + 10 : -1;
+          if (v < 0) continue;
+          if (n % 2 == 0) a[n / 2] = (uint8_t) (v << 4); else a[n / 2] |= (uint8_t) v;
+          n++;
+        }
+        if (n == 12) {
+          for (int i = 0; i < 6; i++) TARGET[i] = a[5 - i];
+          snprintf(msg, sizeof msg, "# TARGET %02x:%02x:%02x:%02x:%02x:%02x\n", a[0], a[1], a[2], a[3], a[4], a[5]);
+          cdc_puts(msg);
+          rescan = true;
+        }
+      }
+      cmd_len = 0;
+      if (rescan) {
         NVIC_DisableIRQ(RADIO_IRQn);
         NVIC_DisableIRQ(TIMER0_IRQn);
         start_scan();

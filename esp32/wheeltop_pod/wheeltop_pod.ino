@@ -15,6 +15,8 @@
 //   layout             вывести хэндлы своего GATT
 //   reset              вернуть настройки по умолчанию
 //   info               текущие настройки
+//   mode app|pod       app: плата подключается к RD как приложение Wheeltop, родной шифтер остаётся сопряжённым;
+//                      pod: плата притворяется шифтером (с перезагрузкой)
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -70,6 +72,7 @@ struct Button {
   bool holdSent = false;
   uint32_t changedAt = 0;
   uint32_t pressedAt = 0;
+  uint32_t repeatAt = 0;
 };
 Button buttonUp{PIN_UP, true}, buttonDown{PIN_DOWN, false};
 
@@ -95,6 +98,8 @@ struct Found {
 };
 std::vector<Found> found;
 bool scanAll = false;
+bool userScan = false; // скан запущен командой s/a, а не поиском RD
+bool appMode = false;  // режим приложения: см. «режим приложения» ниже
 
 // ---------- утилиты ----------
 
@@ -324,8 +329,147 @@ void sendCode(uint8_t code, bool quiet = false) {
 
 uint8_t pressCode(bool up) { return up ? (fineTune ? UP_FINE_PRESSED : UP_PRESSED) : (fineTune ? DOWN_FINE_PRESSED : DOWN_PRESSED); }
 
+// ---------- режим приложения ----------
+// Плата подключается к RD как приложение Wheeltop на телефоне (central), родной шифтер при этом остаётся сопряжённым.
+// Протокол в разделе 19 спецификации, проверен Маком (mac/rd_app.m) 2026-11-03.
+// Кадр: fe 32 <сеанс> <команда> <длина> <данные> <CRC-16/MODBUS, старший байт первым>.
+
+static const uint8_t RD_ADDR[6] = {0xe0, 0x00, 0x00, 0x00, 0x00, 0x03}; // в manufacturer data RD после ff ff
+static const uint32_t REPEAT_MS = 300; // кнопку держат: после HOLD_MS переключаем каждые 300 мс
+
+NimBLEClient *appClient = nullptr;
+NimBLERemoteCharacteristic *appWrite = nullptr;
+NimBLEAddress rdAddr;
+volatile bool rdFound = false;
+volatile bool haveSession = false;
+volatile uint8_t session = 0; // из ответа RD на приветствие, команды с другим сеансом RD молча игнорирует
+volatile int lastGear = -1;
+uint32_t helloAt = 0;
+
+bool appConnected() { return appClient && appClient->isConnected(); }
+
+bool isRd(const NimBLEAdvertisedDevice *d) {
+  std::string m = d->getManufacturerData();
+  return (m.size() >= 8 && memcmp(m.data() + 2, RD_ADDR, 6) == 0) || (d->haveName() && d->getName().rfind("EDS OX", 0) == 0);
+}
+
+uint16_t crc16modbus(const uint8_t *p, size_t n) {
+  uint16_t c = 0xffff;
+  for (size_t i = 0; i < n; i++) {
+    c ^= p[i];
+    for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xa001 : c >> 1;
+  }
+  return c;
+}
+
+void appSend(uint8_t s, uint8_t cmd, const uint8_t *data, uint8_t len, bool quiet = false) {
+  uint8_t f[40] = {0xfe, 0x32, s, cmd, len};
+  memcpy(f + 5, data, len);
+  size_t n = 5 + len;
+  uint16_t c = crc16modbus(f, n);
+  f[n++] = c >> 8;
+  f[n++] = c & 0xff;
+  if (!quiet) Serial.printf("-> RD %s%s\n", hex(f, n).c_str(), appConnected() ? "" : "  (RD не подключён, кадр в никуда)");
+  if (appWrite && appConnected()) appWrite->writeValue(f, n, false);
+}
+
+void appHello() {
+  helloAt = millis();
+  appSend(0x00, 0x11, (const uint8_t *)"yOTmK50z", 8, true);
+}
+
+void appShift(bool up) {
+  Serial.printf("Передача %s (как приложение)%s\n", up ? "ВВЕРХ" : "ВНИЗ", haveSession ? "" : ": нет сеанса с RD, пропускаю");
+  if (!haveSession) return;
+  uint8_t v = up ? 0x02 : 0x01;
+  appSend(session, 0x99, &v, 1, true);
+}
+
+// Ответы RD перемешаны XOR с ключом (K − 0x32), K второй байт кадра.
+void onRdNotify(NimBLERemoteCharacteristic *c, uint8_t *b, size_t n, bool isNotify) {
+  if (n < 5 || b[0] != 0xfe) {
+    logEvent("<- RD %s\n", hex(b, n).c_str());
+    return;
+  }
+  uint8_t key = b[1] - 0x32, q[64];
+  size_t m = min(n - 4, sizeof q);
+  for (size_t i = 0; i < m; i++) q[i] = b[2 + i] ^ key;
+  if (m >= 2 && q[1] == 0x11) {
+    session = q[0];
+    haveSession = true;
+    logEvent("RD: сеанс %02x, можно переключать\n", session);
+  } else if (m >= 8 && q[1] == 0x98) { // отчёт о передаче: S 98 06 4f 00 21 00 GG 00, раз в секунду и после каждого переключения
+    if (q[7] != lastGear) logEvent("RD: передача %d\n", q[7]);
+    lastGear = q[7];
+  } else if (m >= 4 && q[1] == 0x99) {
+    if (q[3]) logEvent("RD: переключение не принято, код %02x\n", q[3]);
+  } else {
+    logEvent("<- RD %s\n", hex(q, m).c_str());
+  }
+}
+
+void appConnect() {
+  rdFound = false;
+  NimBLEDevice::getScan()->stop();
+  if (!appClient) {
+    appClient = NimBLEDevice::createClient();
+    appClient->setConnectTimeout(5000);
+  }
+  logEvent("Подключаюсь к RD %s\n", rdAddr.toString().c_str());
+  if (!appClient->connect(rdAddr)) {
+    logEvent("RD: не подключился\n");
+    return;
+  }
+  NimBLERemoteService *svc = appClient->getService(SERVICE_UUID);
+  NimBLERemoteCharacteristic *notify = svc ? svc->getCharacteristic(BUTTONS_UUID) : nullptr;
+  appWrite = svc ? svc->getCharacteristic(RDWRITE_UUID) : nullptr;
+  if (!notify || !appWrite || !notify->subscribe(true, onRdNotify)) {
+    logEvent("RD: нет сервиса NUS или подписка не удалась\n");
+    appWrite = nullptr;
+    appClient->disconnect();
+    return;
+  }
+  logEvent("Подключился к RD, шлю приветствие\n");
+  appHello();
+}
+
+// Ищем RD, подключаемся, после разрыва ищем снова. Если RD не ответил на приветствие, повторяем раз в 2 с.
+void appLoop() {
+  if (!appConnected()) {
+    if (appWrite) {
+      appWrite = nullptr;
+      haveSession = false;
+      lastGear = -1;
+      logEvent("RD отключился, ищу снова\n");
+    }
+    if (rdFound) appConnect();
+    else if (!NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(0, false, true);
+    return;
+  }
+  if (!haveSession && millis() - helloAt > 2000) appHello();
+}
+
+// В режиме приложения: нажатие переключает один раз, удержание повторяет переключение.
+void pollAppButton(Button &b) {
+  uint32_t now = millis();
+  bool down = digitalRead(b.pin) == LOW;
+  if (down != b.pressed && now - b.changedAt > DEBOUNCE_MS) {
+    b.changedAt = now;
+    b.pressed = down;
+    if (down) {
+      b.pressedAt = b.repeatAt = now;
+      appShift(b.up);
+    }
+  }
+  if (b.pressed && now - b.pressedAt > HOLD_MS && now - b.repeatAt > REPEAT_MS) {
+    b.repeatAt = now;
+    appShift(b.up);
+  }
+}
+
 // Повторяет кадры настоящего пода: press, один hold после ~540 мс (так в записи 2026-10-23), release.
 void pollButton(Button &b) {
+  if (appMode) return pollAppButton(b);
   uint32_t now = millis();
   bool down = digitalRead(b.pin) == LOW;
   if (down != b.pressed && now - b.changedAt > DEBOUNCE_MS) {
@@ -362,11 +506,12 @@ void pollFineSwitch() {
 
 // Подключён RD: горит. Ждём RD: короткая вспышка раз в секунду.
 void updateLed() {
-  bool on = rdConnected() ? true : (millis() % 1000) < 60;
+  bool on = (appMode ? haveSession : rdConnected()) ? true : (millis() % 1000) < 60;
   digitalWrite(PIN_LED, on ? LOW : HIGH);
 }
 
 void click(bool up) {
+  if (appMode) return appShift(up);
   Serial.printf("Передача %s%s\n", up ? "ВВЕРХ" : "ВНИЗ", fineTune ? " (fine-tune)" : "");
   sendCode(pressCode(up));
   delay(120);
@@ -377,6 +522,11 @@ void click(bool up) {
 
 class ScanCB : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *d) override {
+    if (appMode && !rdFound && !appConnected() && isRd(d)) {
+      rdAddr = d->getAddress();
+      rdFound = true;
+    }
+    if (!userScan) return;
     std::string m = d->getManufacturerData();
     bool wt = isWheeltop(m);
     if (!wt && !scanAll) return;
@@ -392,6 +542,8 @@ class ScanCB : public NimBLEScanCallbacks {
     Serial.printf("    raw: %s\n", hex(d->getPayload().data(), d->getPayload().size()).c_str());
   }
   void onScanEnd(const NimBLEScanResults &r, int reason) override {
+    if (!userScan) return;
+    userScan = false;
     Serial.printf("Скан окончен, найдено: %u\n", (unsigned)found.size());
   }
 };
@@ -434,7 +586,7 @@ void dumpGatt(const NimBLEAddress &addr) {
   }
   NimBLEDevice::deleteClient(c);
   Serial.println("Разбор GATT окончен");
-  startAdv();
+  if (!appMode) startAdv();
 }
 
 // BLE_UUID16_DECLARE это составной литерал C, в C++ он не компилируется, поэтому UUID держим в NimBLEUUID.
@@ -488,6 +640,7 @@ void loadPrefs() {
   }
   macStr = prefs.getString("mac", "");
   macType = prefs.getUChar("atype", BLE_ADDR_PUBLIC);
+  appMode = prefs.getString("mode", "pod") == "app";
 }
 
 void restart() {
@@ -498,6 +651,13 @@ void restart() {
 }
 
 void printInfo() {
+  if (appMode) {
+    Serial.printf("Режим: приложение. RD подключён: %s, сеанс: %s, передача: %d\n", appConnected() ? "да" : "нет",
+                  haveSession ? "есть" : "нет", lastGear);
+    Serial.printf("BLE-адрес: %s\n", NimBLEDevice::getAddress().toString().c_str());
+    return;
+  }
+  Serial.println("Режим: шифтер (под)");
   Serial.printf("Тип пода: 0x%02x %s\n", podType(), typeName(podType()));
   Serial.printf("Реклама (mfr): %s\n", hex(mfr.data(), mfr.size()).c_str());
   Serial.printf("BLE-адрес: %s%s\n", NimBLEDevice::getAddress().toString().c_str(),
@@ -527,6 +687,7 @@ void handle(String line) {
     Serial.printf("Fine-tune: %s\n", fineTune ? "вкл (T)" : "выкл (R)");
   } else if (cmd == "s" || cmd == "a") {
     scanAll = cmd == "a";
+    userScan = true;
     found.clear();
     Serial.printf("Сканирую 5 с (%s)…\n", scanAll ? "все устройства" : "только WHEELTOP");
     NimBLEDevice::getScan()->start(5000, false, true);
@@ -577,6 +738,10 @@ void handle(String line) {
   } else if (cmd == "log") {
     Serial.print(eventLog.length() ? eventLog : String("событий нет\n"));
     Serial.printf("Ключей сопряжения в памяти: %d\n", NimBLEDevice::getNumBonds());
+  } else if (cmd == "mode") {
+    if (arg != "app" && arg != "pod") { Serial.println("mode app|pod"); return; }
+    prefs.putString("mode", arg);
+    restart();
   } else if (cmd == "info") printInfo();
   else Serial.printf("Неизвестная команда: %s\n", line.c_str());
 }
@@ -611,13 +776,13 @@ void setup() {
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   registerPodGatt();
-  startAdv();
+  if (!appMode) startAdv(); // в режиме приложения не рекламируемся: RD подключается к родному шифтеру
 
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(new ScanCB(), false);
   scan->setActiveScan(true);
 
-  Serial.println("WHEELTOP pod emulator готов. Команды: u d f s a clone type mac raw reset info");
+  Serial.println("WHEELTOP pod emulator готов. Команды: u d f s a clone type mac raw reset info mode");
   printInfo();
 }
 
@@ -636,6 +801,7 @@ void loop() {
   pollButton(buttonDown);
   pollFineSwitch();
   updateLed();
+  if (appMode) appLoop();
   if (ackPending) {
     ackPending = false;
     static const uint8_t none = 0;

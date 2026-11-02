@@ -10,3 +10,5 @@ mac/wheeltop-shifter
 .DS_Store
 dongle/sniffer/build/
 __pycache__/
+mac/board-buttons
+mac/rd-app
