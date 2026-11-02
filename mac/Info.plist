@@ -7,6 +7,6 @@
 	<key>CFBundleName</key>
 	<string>wheeltop-shifter</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Нужен, чтобы притворяться шифтером WHEELTOP и переключать передачи.</string>
+	<string>Needed to talk to the WHEELTOP derailleur and shift gears.</string>
 </dict>
 </plist>

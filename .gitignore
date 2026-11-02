@@ -1,14 +1,20 @@
-# Сборка
+# Build output
 esp32/wheeltop_pod/build/
 mac/wheeltop-shifter
 
-# Журналы опытов
+# Experiment logs
 *.log
 
-# Настройки Obsidian и macOS
+# Obsidian and macOS settings
 .obsidian/
 .DS_Store
 dongle/sniffer/build/
 __pycache__/
 mac/board-buttons
 mac/rd-app
+
+# Sniffer recordings: they contain the addresses of nearby devices
+*.pcap
+*.pcapng
+mac/sniff*.txt
+mac/dongle-*.txt

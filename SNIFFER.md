@@ -1,26 +1,42 @@
-# Подслушать разговор шифтера с переключателем
+# Sniffing the derailleur's BLE connections
 
-Зачем: при подключении переключатель (RD) пишет шифтеру 20 байт `03 01 00 00 01 01 03 22 …`.
-Настоящий шифтер на них как-то отвечает, плата молчит, и сопряжение слетает
-(`wheeltop_eds_protocol_spec.md`, разделы 14–15). Сниффер только слушает эфир, поэтому сопряжение не тронет.
+The protocol in [wheeltop_eds_protocol_spec.md](wheeltop_eds_protocol_spec.md) was worked out by recording
+the derailleur (RD) talking to the shifter and to the phone app. The stock nRF Sniffer couldn't follow these
+connections because the RD uses Channel Selection Algorithm #2, so this repository has its own sniffer firmware.
+A sniffer only listens, so it can't break pairing.
 
-## Что купить
+## Hardware
 
-**Nordic nRF52840 Dongle** (маркировка PCA10059). Это синий USB-свисток Nordic, 10–20 $.
-Его официально поддерживает nRF Sniffer for Bluetooth LE. Клоны и другие платы на nRF52840 могут не подойти.
+**Nordic nRF52840 Dongle** (PCA10059), the blue USB dongle, about $10–20.
 
-## Что поставить на Мак (когда придёт свисток)
+## Building and flashing the firmware
 
-- Wireshark.
-- nRF Sniffer for Bluetooth LE от Nordic: прошивка для свистка и плагин для Wireshark.
-  Подробности проверим при установке, версии у Nordic меняются.
+Needs the Arm GNU toolchain (`arm-none-eabi-gcc` with newlib, e.g. the xPack build), a TinyUSB checkout
+and `nrfutil` with `nrf5sdk-tools`. See `dongle/build.sh` for the paths it expects.
 
-## План записи
+```sh
+dongle/build.sh                     # builds dongle/sniffer/build/wheeltop_sniffer.zip
+dongle/build.sh flash /dev/cu.usbmodemXXXX
+```
 
-1. Плата выключена. Шифтер слинкован и переключает.
-2. Сниффер пишет эфир и следит за адресом шифтера `c0:00:00:00:00:01`.
-3. Шифтер засыпает, потом его будят: переключатель подключается к нему заново.
-   Сниффер должен поймать **начало** соединения, иначе не сможет за ним следовать.
-4. Нажать кнопки, чтобы в записи были и кадры кнопок.
-5. В записи ищем запись RD в хэндл `0x000d` и уведомления шифтера с `0x000f` сразу после неё.
-6. Учим плату отвечать так же и повторяем проверку с выключением платы.
+To flash, put the dongle in bootloader mode: press its side RESET button, the LED pulses red, and a new
+`/dev/cu.usbmodem…` port appears.
+
+## Recording
+
+```sh
+python3 mac/dongle_sniff.py TARGET capture.pcap
+```
+
+`TARGET` is the address of the peripheral whose connections to follow:
+
+- the shifter (pod), to record the RD connecting to it;
+- the RD, to record the phone app connecting to it.
+
+The board's `s`/`a` commands or any BLE scanner app show the addresses. The sniffer has to catch the
+**start** of a connection (CONNECT_IND), so start recording first, then wake the devices (move the bike or
+press a shifter button). The script prints ATT traffic as it goes, writes a `.pcap` for Wireshark
+(DLT 256, Bluetooth LE LL with PHDR) and a `.txt` with the raw lines.
+
+Recordings contain the addresses of your devices and of everything else nearby, so they are not in
+this repository.

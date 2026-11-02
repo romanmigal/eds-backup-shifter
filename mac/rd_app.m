@@ -1,15 +1,15 @@
-// rd-app: Мак подключается к заднему переключателю (RD) так же, как приложение Wheeltop,
-// и переключает передачи командами приложения. Шифтер при этом остаётся сопряжённым с RD.
-// Протокол записан свистком 2026-11-03 (mac/sniff16-app.*), раздел 19 спецификации.
+// rd-app: the Mac connects to the rear derailleur (RD) the way the Wheeltop app does and shifts gears
+// with the app's commands. The shifter stays paired with the RD. Protocol: section 19 of the spec.
 //
-// Кадр: fe <K> <байты…> <CRC-16/MODBUS по всему кадру, старший байт первым>.
-// Байты после K перемешаны XOR с ключом (K − 0x32). Мы, как и приложение, шлём K = 0x32, то есть без перемешивания.
-// Открытый вид: <сеанс> <команда> <длина> <данные…>
-//   fe 32 00 11 08 "yOTmK50z"  — приветствие; RD отвечает <сеанс> 11 01 <сеанс>
-//   fe 32 <сеанс> 99 01 02     — передача вверх, 01 — вниз
+// Frame: fe <K> <bytes…> <CRC-16/MODBUS over the whole frame, high byte first>.
+// The bytes after K are XORed with the key (K − 0x32). Like the app, we send K = 0x32, i.e. unscrambled.
+// Plain form: <session> <command> <length> <data…>
+//   fe 32 00 11 08 "yOTmK50z"  hello; the RD replies <session> 11 01 <session>
+//   fe 32 <session> 99 01 02   shift up, 01 is down
 //
-// Клавиши: u — вверх, d — вниз, i — повторить всё, что слало приложение при подключении, q — выход.
-// Сборка: ./build.sh
+// Connects to the first RD whose name starts with "EDS OX".
+// Keys: u up, d down, i repeat everything the app sends after connecting, q quit.
+// Build: ./build.sh
 
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <Foundation/Foundation.h>
@@ -19,7 +19,6 @@
 static NSString *const kService = @"6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static NSString *const kWrite = @"6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 static NSString *const kNotify = @"6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-static const uint8_t RD_ADDR[6] = {0xe0, 0x00, 0x00, 0x00, 0x00, 0x03}; // в manufacturer data RD после ff ff
 
 static uint16_t crc16modbus(const uint8_t *p, size_t n) {
   uint16_t c = 0xffff;
@@ -30,9 +29,9 @@ static uint16_t crc16modbus(const uint8_t *p, size_t n) {
   return c;
 }
 
-static NSData *appFrame(uint8_t flag, uint8_t cmd, const uint8_t *data, uint8_t len) {
+static NSData *appFrame(uint8_t session, uint8_t cmd, const uint8_t *data, uint8_t len) {
   NSMutableData *d = [NSMutableData data];
-  uint8_t head[5] = {0xfe, 0x32, flag, cmd, len};
+  uint8_t head[5] = {0xfe, 0x32, session, cmd, len};
   [d appendBytes:head length:5];
   if (len) [d appendBytes:data length:len];
   uint16_t c = crc16modbus(d.bytes, d.length);
@@ -62,7 +61,7 @@ static NSString *ascii(NSData *d) {
   CBCentralManager *_cm;
   CBPeripheral *_rd;
   CBCharacteristic *_w;
-  uint8_t _session; // номер сеанса из ответа RD на приветствие
+  uint8_t _session; // session number from the RD's hello reply
 }
 
 - (instancetype)init {
@@ -78,26 +77,16 @@ static NSString *ascii(NSData *d) {
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)c {
-  if (c.state != CBManagerStatePoweredOn) { [self log:@"Bluetooth выключен или нет доступа"]; return; }
-  [self log:@"Ищу переключатель EDS… покачайте велосипед"];
+  if (c.state != CBManagerStatePoweredOn) { [self log:@"Bluetooth is off or access was denied"]; return; }
+  [self log:@"Looking for the EDS derailleur… move the bike to wake it"];
   [c scanForPeripheralsWithServices:nil options:nil];
 }
 
 - (void)centralManager:(CBCentralManager *)c didDiscoverPeripheral:(CBPeripheral *)p
      advertisementData:(NSDictionary *)ad RSSI:(NSNumber *)rssi {
-  NSData *m = ad[CBAdvertisementDataManufacturerDataKey];
   NSString *name = ad[CBAdvertisementDataLocalNameKey] ?: p.name;
-  BOOL ours = (m.length >= 8 && memcmp((const uint8_t *)m.bytes + 2, RD_ADDR, 6) == 0) ||
-              [name hasPrefix:@"EDS OX"];
-  static NSMutableSet *seen;
-  if (!seen) seen = [NSMutableSet set];
-  if ((name || m) && ![seen containsObject:p.identifier]) {
-    [seen addObject:p.identifier];
-    if ([name containsString:@"EDS"] || (m.length >= 2 && ((const uint8_t *)m.bytes)[0] == 0xff))
-      [self log:[NSString stringWithFormat:@"вижу %@ mfr %@", name, hex(m)]];
-  }
-  if (!ours) return;
-  [self log:[NSString stringWithFormat:@"Нашёл %@ (%@ дБм), подключаюсь", p.name ?: ad[CBAdvertisementDataLocalNameKey], rssi]];
+  if (![name hasPrefix:@"EDS OX"]) return;
+  [self log:[NSString stringWithFormat:@"Found %@ (%@ dBm), connecting", name, rssi]];
   [c stopScan];
   _rd = p;
   p.delegate = self;
@@ -105,18 +94,18 @@ static NSString *ascii(NSData *d) {
 }
 
 - (void)centralManager:(CBCentralManager *)c didConnectPeripheral:(CBPeripheral *)p {
-  [self log:@"Подключился, ищу сервис"];
+  [self log:@"Connected, looking for the service"];
   [p discoverServices:@[[CBUUID UUIDWithString:kService]]];
 }
 
 - (void)centralManager:(CBCentralManager *)c didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
-  [self log:[NSString stringWithFormat:@"Отключился: %@. Ищу снова", e.localizedDescription ?: @"-"]];
+  [self log:[NSString stringWithFormat:@"Disconnected: %@. Searching again", e.localizedDescription ?: @"-"]];
   _w = nil;
   [c scanForPeripheralsWithServices:nil options:nil];
 }
 
 - (void)centralManager:(CBCentralManager *)c didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)e {
-  [self log:[NSString stringWithFormat:@"Не подключился: %@", e.localizedDescription]];
+  [self log:[NSString stringWithFormat:@"Connection failed: %@", e.localizedDescription]];
   [c scanForPeripheralsWithServices:nil options:nil];
 }
 
@@ -132,8 +121,8 @@ static NSString *ascii(NSData *d) {
 }
 
 - (void)peripheral:(CBPeripheral *)p didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)ch error:(NSError *)e {
-  if (e) { [self log:[NSString stringWithFormat:@"Подписка не удалась: %@", e.localizedDescription]]; return; }
-  [self log:@"Подписался. Шлю приветствие приложения. Клавиши: u — вверх, d — вниз, i — инициализация, q — выход"];
+  if (e) { [self log:[NSString stringWithFormat:@"Subscription failed: %@", e.localizedDescription]]; return; }
+  [self log:@"Subscribed. Sending the app's hello. Keys: u up, d down, i init sequence, q quit"];
   [self hello];
 }
 
@@ -147,17 +136,17 @@ static NSString *ascii(NSData *d) {
     for (NSUInteger i = 0; i < plain.length; i++) q[i] = b[2 + i] ^ key;
     if (plain.length >= 2 && q[1] == 0x11) {
       _session = q[0];
-      [self log:[NSString stringWithFormat:@"<- %@   ответ на приветствие, сеанс %02x", hex(v), _session]];
+      [self log:[NSString stringWithFormat:@"<- %@   hello reply, session %02x", hex(v), _session]];
       return;
     }
-    [self log:[NSString stringWithFormat:@"<- %@   открыто: %@", hex(v), hex(plain)]];
+    [self log:[NSString stringWithFormat:@"<- %@   plain: %@", hex(v), hex(plain)]];
     return;
   }
   [self log:[NSString stringWithFormat:@"<- %@   %@", hex(v), ascii(v)]];
 }
 
 - (void)send:(NSData *)d {
-  if (!_w) { [self log:@"Ещё не подключён"]; return; }
+  if (!_w) { [self log:@"Not connected yet"]; return; }
   [self log:[NSString stringWithFormat:@"-> %@", hex(d)]];
   [_rd writeValue:d forCharacteristic:_w type:CBCharacteristicWriteWithoutResponse];
 }
@@ -166,7 +155,7 @@ static NSString *ascii(NSData *d) {
   [self send:appFrame(0x00, 0x11, (const uint8_t *)"yOTmK50z", 8)];
 }
 
-// Всё, что приложение слало после приветствия (sniff16-app), по порядку
+// Everything the app sent after the hello, in order
 - (void)initSequence {
   uint8_t a[] = {0x80};
   [self send:appFrame(_session, 0xfa, a, 1)];

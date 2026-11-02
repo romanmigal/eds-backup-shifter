@@ -1,0 +1,26 @@
+# wheeltop
+
+Shift a WHEELTOP EDS electronic rear derailleur with your own buttons: an ESP32 board connects to the
+derailleur over Bluetooth LE the way the Wheeltop phone app does, so the stock shifter keeps working too.
+
+Not affiliated with Wheeltop. The protocol was reverse-engineered; use at your own risk.
+
+## Quick start
+
+1. Get an ESP32-C3 SuperMini (any ESP32 with Bluetooth LE works) and two push buttons.
+   Wire the buttons between pins 4/5 and GND: [esp32/WIRING.md](esp32/WIRING.md).
+2. Flash `esp32/wheeltop_pod`: [esp32/README.md](esp32/README.md).
+3. Power the board, wake the derailleur by moving the bike and keep the board close to it.
+   The board pairs with the nearest derailleur and remembers it; the blue LED stays on when connected.
+4. Press the buttons to shift. The stock shifter still works.
+
+## Contents
+
+| Path | What |
+|---|---|
+| [wheeltop_eds_protocol_spec.md](wheeltop_eds_protocol_spec.md) | the protocols: shifter → derailleur and app → derailleur |
+| [esp32/](esp32/) | board firmware (Arduino, NimBLE-Arduino) and wiring |
+| [mac/](mac/) | macOS tools: the Mac as the app (`rd-app`), on-screen buttons for the board, the original pod emulator |
+| [dongle/](dongle/), [SNIFFER.md](SNIFFER.md) | BLE sniffer firmware for the nRF52840 Dongle that follows CSA #2 connections |
+
+Tested with an EDS OX2 rear derailleur and a TX Right shifter.

@@ -17,7 +17,7 @@
 #define CFG_TUSB_MEM_ALIGN    __attribute__ ((aligned(4)))
 #define CFG_TUD_ENDPOINT0_SIZE 64
 
-// Один USB-порт (CDC), через него идут строки с пакетами
+// One USB port (CDC) carrying the packet lines
 #define CFG_TUD_CDC           1
 #define CFG_TUD_MSC           0
 #define CFG_TUD_HID           0

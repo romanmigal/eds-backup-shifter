@@ -1,22 +1,32 @@
-// wheeltop_pod: ESP32 притворяется шифтером (подом) WHEELTOP EDS.
-// Мак шлёт команды по USB (115200, строки с \n), ESP32 шлёт заднему переключателю (RD) кадры кнопок.
-// Или без Мака: кнопки на ножках 4 и 5, переключатель R/T на 6 (схема в ../WIRING.md).
-// Протокол: ../../wheeltop_eds_protocol_spec.md
+// wheeltop_pod: an ESP32 board with two buttons that shifts a WHEELTOP EDS rear derailleur (RD).
 //
-// Команды:
-//   u / d              передача вверх / вниз (press, 120 мс, release)
-//   f                  fine-tune вкл/выкл (ползунок R/T)
-//   s / a              скан 5 с: только поды WHEELTOP / все устройства
-//   clone N            скопировать адрес и рекламу пода N из последнего скана (с перезагрузкой)
-//   type ox|tx-front|tx-left|tx-right   тип пода (с перезагрузкой)
-//   mac AA:BB:CC:DD:EE:FF [public|random] | mac off   свой BLE-адрес (с перезагрузкой)
-//   raw 04 38 02 3e    отправить произвольный кадр notify на …0003
-//   gatt N             подключиться к устройству N из скана и вывести его GATT с хэндлами (нужен mac off)
-//   layout             вывести хэндлы своего GATT
-//   reset              вернуть настройки по умолчанию
-//   info               текущие настройки
-//   mode app|pod       app: плата подключается к RD как приложение Wheeltop, родной шифтер остаётся сопряжённым;
-//                      pod: плата притворяется шифтером (с перезагрузкой)
+// Two modes:
+//   app (default)  The board connects to the RD the way the Wheeltop phone app does (BLE central).
+//                  The native shifter stays paired and keeps working. On first start the board pairs with
+//                  the nearest RD it finds and remembers it; `pair` or holding both buttons for 5 s pairs again.
+//   pod            The board pretends to be the shifter (pod). The RD must be paired with the board instead
+//                  of the native shifter. Kept for protocol research.
+//
+// The board is controlled over USB serial (115200, lines ending in \n) or with buttons on pins 4 and 5
+// (wiring in ../WIRING.md). Protocol: ../../wheeltop_eds_protocol_spec.md
+//
+// Commands:
+//   u / d              shift up / down
+//   pair               forget the paired RD and pair with the nearest one (app mode)
+//   mode app|pod       switch mode (restarts)
+//   info               current settings
+//   log                events since start-up
+//   reset              restore defaults (restarts)
+// Pod mode only:
+//   f                  fine-tune on/off (the R/T switch)
+//   type ox|tx-front|tx-left|tx-right   pod type (restarts)
+//   mac AA:BB:CC:DD:EE:FF [public|random] | mac off   own BLE address (restarts)
+//   raw 04 38 02 3e    send any notify frame on …0003
+// Research:
+//   s / a              scan 5 s: WHEELTOP devices only / everything
+//   clone N            copy the address and advertisement of device N from the last scan (restarts)
+//   gatt N             connect to device N from the scan and print its GATT with handles (needs mac off)
+//   layout             print the handles of our own GATT
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -24,14 +34,14 @@
 #include <vector>
 
 static const char *SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-// Как в стандартном NUS, проверено на настоящем TX Right 2026-10-23 (спецификация говорила наоборот).
-static const char *RDWRITE_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write, write-nr: запись от RD
-static const char *BUTTONS_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify: кнопки
+static const char *RDWRITE_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write, write-nr
+static const char *BUTTONS_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
 
-// Реклама настоящего пода TX Right, снятая Маком 2026-10-23: company id ff ff, префикс, тип 0x38,
-// прошивка 5.7, батарея 3.30 В и ещё 9 байт неизвестного назначения.
+// Advertisement of a real TX Right pod: company id ff ff, prefix, type 0x38, firmware 5.7, battery,
+// unknown bytes and, in the last 6 bytes, the address of the RD the pod is paired with (little-endian).
+// The last 6 bytes are filled in from the paired RD (see podMfr()).
 static const std::vector<uint8_t> DEFAULT_MFR = {0xff, 0xff, 0x07, 0x0f, 0x00, 0x14, 0x55, 0x6a, 0x84, 0x38, 0x05, 0x07,
-                                                 0x01, 0x4a, 0x90, 0x6a, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0xe0};
+                                                 0x01, 0x4a, 0x90, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t PREFIX[] = {0x07, 0x0f, 0x00, 0x14, 0x55, 0x6a, 0x84};
 
 enum : uint8_t {
@@ -42,28 +52,32 @@ enum : uint8_t {
 
 Preferences prefs;
 std::vector<uint8_t> mfr;
-String macStr;     // пусто: заводской адрес ESP32
-uint8_t macType;   // BLE_ADDR_PUBLIC или BLE_ADDR_RANDOM
+String macStr;     // empty: the ESP32's factory address
+uint8_t macType;   // BLE_ADDR_PUBLIC or BLE_ADDR_RANDOM
+bool appMode = true;
+String rdStr;      // paired RD, "aa:bb:cc:dd:ee:ff"; empty: not paired yet
+uint8_t rdType;
 
-volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE; // соединение с RD
+volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE; // pod mode: connection from the RD
 volatile int subscribers = 0;
 uint8_t ownAddrType = BLE_OWN_ADDR_PUBLIC;
 bool fineTune = false;
-// Как у настоящего пода (сниффер, 2026-11-02, mac/sniff12.pcap):
-// на 20 байт от RD в …0002 под отвечает пустым notify на …0003,
-// а примерно через 1,7 с после подключения просит параметры 40–80 мс, latency 4, таймаут 2 с.
-// Статус-кадров раз в секунду настоящий под RD не шлёт.
+// Like the real pod (sniffer, 2026-11-02): it answers the RD's 20-byte write to …0002 with an empty notify
+// on …0003 and about 1.7 s after connecting asks for 40–80 ms, latency 4, timeout 2 s.
+// The real pod sends no periodic status frames.
 volatile bool ackPending = false;
 uint32_t connectedAt = 0;
 bool paramsRequested = false;
 
-// Внешние кнопки на ESP32-C3 SuperMini: кнопка между ножкой и GND, подтяжка внутренняя.
-static const int PIN_UP = 4;     // верхняя кнопка: передача вверх
-static const int PIN_DOWN = 5;   // нижняя кнопка: передача вниз
-static const int PIN_FINE = 6;   // переключатель на GND = положение T (fine-tune), разомкнут = R
-static const int PIN_LED = 8;    // синий светодиод SuperMini, горит при LOW
+// External buttons on an ESP32-C3 SuperMini: button between the pin and GND, internal pull-up.
+static const int PIN_UP = 4;     // upper button: shift up
+static const int PIN_DOWN = 5;   // lower button: shift down
+static const int PIN_FINE = 6;   // switch to GND = T position (fine-tune), open = R
+static const int PIN_LED = 8;    // blue LED of the SuperMini, lit on LOW
 static const uint32_t DEBOUNCE_MS = 30;
-static const uint32_t HOLD_MS = 540; // настоящий под шлёт код удержания через ~540 мс после нажатия
+static const uint32_t HOLD_MS = 540;     // the real pod sends its hold code ~540 ms after the press
+static const uint32_t REPEAT_MS = 300;   // app mode: a held button shifts again every 300 ms
+static const uint32_t REPAIR_MS = 5000;  // app mode: both buttons held this long start pairing
 
 struct Button {
   int pin;
@@ -76,11 +90,11 @@ struct Button {
 };
 Button buttonUp{PIN_UP, true}, buttonDown{PIN_DOWN, false};
 
-// RD после первого подключения помнит подписку и может не присылать её снова,
-// поэтому кадры шлём любому подключённому, а не только подписанному.
+// After the first connection the RD remembers its subscription and may not send it again,
+// so frames go to any connected RD, not only a subscribed one.
 bool rdConnected() { return connHandle != BLE_HS_CONN_HANDLE_NONE; }
 
-// События BLE копятся и здесь: RD подключается сразу после включения, раньше, чем Мак откроет порт. Команда log.
+// BLE events are also kept here: the RD connects right after power-up, before the Mac opens the port. Command log.
 String eventLog;
 void logEvent(const char *fmt, ...) {
   char line[160];
@@ -89,7 +103,7 @@ void logEvent(const char *fmt, ...) {
   vsnprintf(line, sizeof line, fmt, args);
   va_end(args);
   Serial.print(line);
-  if (eventLog.length() < 6000) eventLog += String(millis()) + " мс: " + line;
+  if (eventLog.length() < 6000) eventLog += String(millis()) + " ms: " + line;
 }
 
 struct Found {
@@ -98,10 +112,9 @@ struct Found {
 };
 std::vector<Found> found;
 bool scanAll = false;
-bool userScan = false; // скан запущен командой s/a, а не поиском RD
-bool appMode = false;  // режим приложения: см. «режим приложения» ниже
+bool userScan = false; // scan started by s/a rather than the search for the RD
 
-// ---------- утилиты ----------
+// ---------- utilities ----------
 
 String hex(const uint8_t *p, size_t n) {
   String s;
@@ -121,14 +134,14 @@ std::vector<uint8_t> parseHex(String s) {
   return out;
 }
 
-// Смещение префикса в manufacturer data или -1. У настоящего пода перед префиксом стоит company id ff ff.
+// Offset of the prefix in manufacturer data, or -1. The real pod has company id ff ff before the prefix.
 int prefixOffset(const uint8_t *m, size_t n) {
   for (size_t off = 0; off <= 2; off += 2)
     if (n >= off + sizeof PREFIX && memcmp(m + off, PREFIX, sizeof PREFIX) == 0) return off;
   return -1;
 }
 
-// Индекс байта типа в mfr
+// Index of the type byte in mfr
 int typeIndex() {
   int off = prefixOffset(mfr.data(), mfr.size());
   return off >= 0 && mfr.size() > (size_t)off + 7 ? off + 7 : -1;
@@ -149,12 +162,12 @@ const char *typeName(uint8_t t) {
 
 bool isWheeltop(const std::string &m) { return prefixOffset((const uint8_t *)m.data(), m.size()) >= 0; }
 
-// ---------- GATT как у настоящего пода ----------
-// NimBLEServer всегда добавляет свои характеристики в сервисы 1800 и 1801, и хэндлы съезжают.
-// RD, похоже, пишет по запомненным хэндлам пода, поэтому таблица собрана вручную,
-// хэндл в хэндл как у пода (снято командой gatt 2026-10-23):
+// ---------- pod GATT, handle for handle like the real pod ----------
+// NimBLEServer always adds its own characteristics to services 1800 and 1801, which shifts the handles.
+// The RD seems to write to the pod's remembered handles, so the table is built by hand
+// (read from a real pod with the gatt command, 2026-10-23):
 //   0x0001 1800  0x0003 2A00 "EDS TX" read/write, 0x0005 2A01, 0x0007 2A04, 0x0009 2AA6
-//   0x000a 1801  пустой
+//   0x000a 1801  empty
 //   0x000b NUS   0x000d …0002 write/write-nr, 0x000f …0003 notify, 0x0010 CCCD
 
 static ble_uuid16_t uuidGap, uuidGatt, uuidName, uuidAppearance, uuidPpcp, uuidCar;
@@ -164,7 +177,7 @@ static ble_gatt_svc_def podSvcs[4];
 static uint16_t hName, hAppearance, hPpcp, hCar, hRdWrite, hButtons;
 static char devName[32] = "EDS TX";
 static const uint8_t APPEARANCE[] = {0x00, 0x00};
-static const uint8_t PPCP[] = {0x20, 0x00, 0x40, 0x00, 0x04, 0x00, 0xc8, 0x00}; // 40–80 мс, latency 4, таймаут 2 с
+static const uint8_t PPCP[] = {0x20, 0x00, 0x40, 0x00, 0x04, 0x00, 0xc8, 0x00}; // 40–80 ms, latency 4, timeout 2 s
 static const uint8_t CAR[] = {0x01};
 
 void setUuid16(ble_uuid16_t &u, uint16_t v) {
@@ -184,14 +197,14 @@ int gapAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *ar
     if (attr == hName) { d = devName; n = strlen(devName); }
     else if (attr == hAppearance) { d = APPEARANCE; n = sizeof APPEARANCE; }
     else if (attr == hPpcp) { d = PPCP; n = sizeof PPCP; }
-    logEvent("ЧТЕНИЕ от RD <- 0x%04x\n", attr);
+    logEvent("READ by RD <- 0x%04x\n", attr);
     return os_mbuf_append(ctxt->om, d, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && attr == hName) {
     uint16_t len = 0;
     ble_hs_mbuf_to_flat(ctxt->om, devName, sizeof devName - 1, &len);
     devName[len] = 0;
-    logEvent("ЗАПИСЬ имени от RD: %s\n", devName);
+    logEvent("RD wrote name: %s\n", devName);
     return 0;
   }
   return BLE_ATT_ERR_UNLIKELY;
@@ -202,7 +215,7 @@ int nusAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *ar
     uint8_t buf[64];
     uint16_t len = 0;
     ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof buf, &len);
-    logEvent("ЗАПИСЬ от RD -> 0x%04x: %s\n", attr, hex(buf, len).c_str());
+    logEvent("WRITE by RD -> 0x%04x: %s\n", attr, hex(buf, len).c_str());
     if (attr == hRdWrite && len == 20) ackPending = true;
     return 0;
   }
@@ -210,45 +223,48 @@ int nusAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *ar
 }
 
 void startAdv();
+void saveRd(const NimBLEAddress &a);
 
 int gapEvent(ble_gap_event *ev, void *arg) {
   ble_gap_conn_desc desc;
   switch (ev->type) {
     case BLE_GAP_EVENT_CONNECT:
-      // Бывает, что статус не 0, а связь всё равно есть (RD потом меняет MTU и подписывается),
-      // поэтому верим наличию соединения, а не статусу.
+      // Sometimes the status is not 0 but the link exists anyway (the RD then changes the MTU and subscribes),
+      // so we trust the connection, not the status.
       if (ev->connect.status == 0 || ble_gap_conn_find(ev->connect.conn_handle, &desc) == 0) {
         connHandle = ev->connect.conn_handle;
-        if (ble_gap_conn_find(connHandle, &desc) == 0)
-          logEvent("Подключился central %s, статус %d, handle %d\n", NimBLEAddress(desc.peer_id_addr).toString().c_str(),
-                        ev->connect.status, connHandle);
+        if (ble_gap_conn_find(connHandle, &desc) == 0) {
+          logEvent("Central connected %s, status %d, handle %d\n", NimBLEAddress(desc.peer_id_addr).toString().c_str(),
+                   ev->connect.status, connHandle);
+          saveRd(NimBLEAddress(desc.peer_id_addr)); // the pod advertises the address of its RD
+        }
       } else {
-        logEvent("Подключение не удалось: %d\n", ev->connect.status);
+        logEvent("Connection failed: %d\n", ev->connect.status);
         startAdv();
       }
       break;
     case BLE_GAP_EVENT_DISCONNECT:
-      logEvent("Отключился, причина 0x%03x\n", ev->disconnect.reason);
+      logEvent("Disconnected, reason 0x%03x\n", ev->disconnect.reason);
       connHandle = BLE_HS_CONN_HANDLE_NONE;
       subscribers = 0;
       connectedAt = 0;
       paramsRequested = false;
-      startAdv(); // настоящий под снова рекламируется сразу после разрыва
+      startAdv(); // the real pod advertises again right after a disconnect
       break;
     case BLE_GAP_EVENT_SUBSCRIBE:
-      logEvent("Подписка на 0x%04x: notify=%d\n", ev->subscribe.attr_handle, ev->subscribe.cur_notify);
+      logEvent("Subscription to 0x%04x: notify=%d\n", ev->subscribe.attr_handle, ev->subscribe.cur_notify);
       if (!rdConnected()) connHandle = ev->subscribe.conn_handle;
       if (ev->subscribe.attr_handle == hButtons) subscribers = ev->subscribe.cur_notify;
       break;
     case BLE_GAP_EVENT_ENC_CHANGE:
-      logEvent("Сопряжение: шифрование, статус %d\n", ev->enc_change.status);
+      logEvent("Pairing: encryption, status %d\n", ev->enc_change.status);
       break;
     case BLE_GAP_EVENT_REPEAT_PAIRING:
       if (ble_gap_conn_find(ev->repeat_pairing.conn_handle, &desc) == 0) ble_store_util_delete_peer(&desc.peer_id_addr);
-      logEvent("Сопряжение: RD просит заново, старый ключ удалён\n");
+      logEvent("Pairing: the RD asks again, old key deleted\n");
       return BLE_GAP_REPEAT_PAIRING_RETRY;
     case BLE_GAP_EVENT_MTU:
-      if (!rdConnected()) connHandle = ev->mtu.conn_handle; // связь есть, даже если CONNECT пришёл с ошибкой
+      if (!rdConnected()) connHandle = ev->mtu.conn_handle; // the link exists even if CONNECT came with an error
       logEvent("MTU %d, handle %d\n", ev->mtu.value, ev->mtu.conn_handle);
       break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -257,12 +273,12 @@ int gapEvent(ble_gap_event *ev, void *arg) {
     case BLE_GAP_EVENT_NOTIFY_TX:
       break;
     default:
-      logEvent("Событие BLE %d\n", ev->type);
+      logEvent("BLE event %d\n", ev->type);
   }
   return 0;
 }
 
-// Как у настоящего пода: в рекламе только manufacturer data, без флагов, имени и UUID сервиса, ответа на скан нет.
+// Like the real pod: manufacturer data only, no flags, name or service UUID, no scan response.
 void startAdv() {
   if (ble_gap_adv_active()) return;
   std::vector<uint8_t> raw = {(uint8_t)(mfr.size() + 1), 0xff};
@@ -272,7 +288,7 @@ void startAdv() {
   params.conn_mode = BLE_GAP_CONN_MODE_UND;
   params.disc_mode = BLE_GAP_DISC_MODE_GEN;
   int rc = ble_gap_adv_start(ownAddrType, nullptr, BLE_HS_FOREVER, &params, gapEvent, nullptr);
-  if (rc) Serial.printf("Реклама не запустилась: %d\n", rc);
+  if (rc) Serial.printf("Advertising did not start: %d\n", rc);
 }
 
 void registerPodGatt() {
@@ -298,22 +314,22 @@ void registerPodGatt() {
 
   memset(podSvcs, 0, sizeof podSvcs);
   podSvcs[0] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidGap.u, .characteristics = gapChrs};
-  podSvcs[1] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidGatt.u}; // пустой, как у пода
+  podSvcs[1] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidGatt.u}; // empty, like the pod
   podSvcs[2] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidNus.u, .characteristics = nusChrs};
 
   ble_gatts_reset();
   int rc = ble_gatts_count_cfg(podSvcs);
   if (!rc) rc = ble_gatts_add_svcs(podSvcs);
   if (!rc) rc = ble_gatts_start();
-  if (rc) Serial.printf("GATT не собрался: %d\n", rc);
+  if (rc) Serial.printf("GATT setup failed: %d\n", rc);
 }
 
-// ---------- кадры ----------
+// ---------- pod frames ----------
 
 void sendFrame(const uint8_t *d, size_t n, bool quiet = false) {
-  if (!quiet) Serial.printf("-> %s%s\n", hex(d, n).c_str(), rdConnected() ? "" : "  (RD не подключён, кадр в никуда)");
+  if (!quiet) Serial.printf("-> %s%s\n", hex(d, n).c_str(), rdConnected() ? "" : "  (RD not connected, frame dropped)");
   if (!rdConnected()) return;
-  ble_gattc_notify_custom(connHandle, hButtons, ble_hs_mbuf_from_flat(d, n)); // без проверки подписки
+  ble_gattc_notify_custom(connHandle, hButtons, ble_hs_mbuf_from_flat(d, n)); // no subscription check
 }
 
 void sendCode(uint8_t code, bool quiet = false) {
@@ -329,28 +345,60 @@ void sendCode(uint8_t code, bool quiet = false) {
 
 uint8_t pressCode(bool up) { return up ? (fineTune ? UP_FINE_PRESSED : UP_PRESSED) : (fineTune ? DOWN_FINE_PRESSED : DOWN_PRESSED); }
 
-// ---------- режим приложения ----------
-// Плата подключается к RD как приложение Wheeltop на телефоне (central), родной шифтер при этом остаётся сопряжённым.
-// Протокол в разделе 19 спецификации, проверен Маком (mac/rd_app.m) 2026-11-03.
-// Кадр: fe 32 <сеанс> <команда> <длина> <данные> <CRC-16/MODBUS, старший байт первым>.
-
-static const uint8_t RD_ADDR[6] = {0xe0, 0x00, 0x00, 0x00, 0x00, 0x03}; // в manufacturer data RD после ff ff
-static const uint32_t REPEAT_MS = 300; // кнопку держат: после HOLD_MS переключаем каждые 300 мс
+// ---------- app mode ----------
+// The board connects to the RD like the Wheeltop phone app (central); the native shifter stays paired.
+// Protocol: section 19 of the spec.
+// Frame: fe 32 <session> <command> <length> <data> <CRC-16/MODBUS, high byte first>.
 
 NimBLEClient *appClient = nullptr;
 NimBLERemoteCharacteristic *appWrite = nullptr;
+volatile bool rdFound = false;     // the scan found the RD to connect to (rdAddr)
 NimBLEAddress rdAddr;
-volatile bool rdFound = false;
 volatile bool haveSession = false;
-volatile uint8_t session = 0; // из ответа RD на приветствие, команды с другим сеансом RD молча игнорирует
+volatile uint8_t session = 0;      // from the RD's hello reply; the RD silently ignores commands with another session
 volatile int lastGear = -1;
 uint32_t helloAt = 0;
 
+// Pairing: collect the RDs seen during PAIR_WINDOW_MS and take the strongest one.
+static const uint32_t PAIR_WINDOW_MS = 3000;
+bool pairing() { return appMode && rdStr.isEmpty(); }
+NimBLEAddress pairBest;
+int pairBestRssi = -1000;
+uint32_t pairFirstSeen = 0;
+
 bool appConnected() { return appClient && appClient->isConnected(); }
 
+// An RD advertises its own address in manufacturer data after company id ff ff (in display order, not
+// little-endian) and calls itself "EDS OX…". Pods have the prefix 07 0f 00 14 55 6a 84 instead.
 bool isRd(const NimBLEAdvertisedDevice *d) {
   std::string m = d->getManufacturerData();
-  return (m.size() >= 8 && memcmp(m.data() + 2, RD_ADDR, 6) == 0) || (d->haveName() && d->getName().rfind("EDS OX", 0) == 0);
+  if (isWheeltop(m)) return false;
+  if (d->haveName() && d->getName().rfind("EDS OX", 0) == 0) return true;
+  const uint8_t *a = d->getAddress().getVal(); // little-endian
+  if (m.size() < 8 || (uint8_t)m[0] != 0xff || (uint8_t)m[1] != 0xff) return false;
+  for (int i = 0; i < 6; i++)
+    if ((uint8_t)m[2 + i] != a[5 - i]) return false;
+  return true;
+}
+
+void saveRd(const NimBLEAddress &a) {
+  String s = a.toString().c_str();
+  if (s == rdStr) return;
+  rdStr = s;
+  rdType = a.getType();
+  prefs.putString("rd", rdStr);
+  prefs.putUChar("rdtype", rdType);
+  logEvent("Paired with RD %s\n", rdStr.c_str());
+}
+
+void forgetRd() {
+  rdStr = "";
+  prefs.remove("rd");
+  pairBestRssi = -1000;
+  pairFirstSeen = 0;
+  rdFound = false;
+  if (appConnected()) appClient->disconnect();
+  logEvent("Pairing: wake the derailleur (move the bike), keep the board close to it\n");
 }
 
 uint16_t crc16modbus(const uint8_t *p, size_t n) {
@@ -362,30 +410,29 @@ uint16_t crc16modbus(const uint8_t *p, size_t n) {
   return c;
 }
 
-void appSend(uint8_t s, uint8_t cmd, const uint8_t *data, uint8_t len, bool quiet = false) {
+void appSend(uint8_t s, uint8_t cmd, const uint8_t *data, uint8_t len) {
   uint8_t f[40] = {0xfe, 0x32, s, cmd, len};
   memcpy(f + 5, data, len);
   size_t n = 5 + len;
   uint16_t c = crc16modbus(f, n);
   f[n++] = c >> 8;
   f[n++] = c & 0xff;
-  if (!quiet) Serial.printf("-> RD %s%s\n", hex(f, n).c_str(), appConnected() ? "" : "  (RD не подключён, кадр в никуда)");
   if (appWrite && appConnected()) appWrite->writeValue(f, n, false);
 }
 
 void appHello() {
   helloAt = millis();
-  appSend(0x00, 0x11, (const uint8_t *)"yOTmK50z", 8, true);
+  appSend(0x00, 0x11, (const uint8_t *)"yOTmK50z", 8);
 }
 
 void appShift(bool up) {
-  Serial.printf("Передача %s (как приложение)%s\n", up ? "ВВЕРХ" : "ВНИЗ", haveSession ? "" : ": нет сеанса с RD, пропускаю");
+  Serial.printf("Shift %s%s\n", up ? "UP" : "DOWN", haveSession ? "" : ": no session with the RD, skipped");
   if (!haveSession) return;
   uint8_t v = up ? 0x02 : 0x01;
-  appSend(session, 0x99, &v, 1, true);
+  appSend(session, 0x99, &v, 1);
 }
 
-// Ответы RD перемешаны XOR с ключом (K − 0x32), K второй байт кадра.
+// The RD's replies are XORed with the key (K − 0x32), K being the second byte of the frame.
 void onRdNotify(NimBLERemoteCharacteristic *c, uint8_t *b, size_t n, bool isNotify) {
   if (n < 5 || b[0] != 0xfe) {
     logEvent("<- RD %s\n", hex(b, n).c_str());
@@ -397,12 +444,12 @@ void onRdNotify(NimBLERemoteCharacteristic *c, uint8_t *b, size_t n, bool isNoti
   if (m >= 2 && q[1] == 0x11) {
     session = q[0];
     haveSession = true;
-    logEvent("RD: сеанс %02x, можно переключать\n", session);
-  } else if (m >= 8 && q[1] == 0x98) { // отчёт о передаче: S 98 06 4f 00 21 00 GG 00, раз в секунду и после каждого переключения
-    if (q[7] != lastGear) logEvent("RD: передача %d\n", q[7]);
+    logEvent("RD: session %02x, ready to shift\n", session);
+  } else if (m >= 8 && q[1] == 0x98) { // gear report S 98 06 4f 00 21 00 GG 00, after every shift and about once a second
+    if (q[7] != lastGear) logEvent("RD: gear %d\n", q[7]);
     lastGear = q[7];
   } else if (m >= 4 && q[1] == 0x99) {
-    if (q[3]) logEvent("RD: переключение не принято, код %02x\n", q[3]);
+    if (q[3]) logEvent("RD: shift not accepted, code %02x\n", q[3]);
   } else {
     logEvent("<- RD %s\n", hex(q, m).c_str());
   }
@@ -415,41 +462,49 @@ void appConnect() {
     appClient = NimBLEDevice::createClient();
     appClient->setConnectTimeout(5000);
   }
-  logEvent("Подключаюсь к RD %s\n", rdAddr.toString().c_str());
+  logEvent("Connecting to RD %s\n", rdAddr.toString().c_str());
   if (!appClient->connect(rdAddr)) {
-    logEvent("RD: не подключился\n");
+    logEvent("RD: connection failed\n");
     return;
   }
   NimBLERemoteService *svc = appClient->getService(SERVICE_UUID);
   NimBLERemoteCharacteristic *notify = svc ? svc->getCharacteristic(BUTTONS_UUID) : nullptr;
   appWrite = svc ? svc->getCharacteristic(RDWRITE_UUID) : nullptr;
   if (!notify || !appWrite || !notify->subscribe(true, onRdNotify)) {
-    logEvent("RD: нет сервиса NUS или подписка не удалась\n");
+    logEvent("RD: no NUS service or subscription failed\n");
     appWrite = nullptr;
     appClient->disconnect();
     return;
   }
-  logEvent("Подключился к RD, шлю приветствие\n");
+  logEvent("Connected to RD, sending hello\n");
   appHello();
 }
 
-// Ищем RD, подключаемся, после разрыва ищем снова. Если RD не ответил на приветствие, повторяем раз в 2 с.
+// Find the RD, connect, search again after a disconnect. If the RD doesn't answer the hello, repeat every 2 s.
+// While pairing, the RD is remembered only after it answers the hello.
 void appLoop() {
   if (!appConnected()) {
     if (appWrite) {
       appWrite = nullptr;
       haveSession = false;
       lastGear = -1;
-      logEvent("RD отключился, ищу снова\n");
+      logEvent("RD disconnected, searching again\n");
+    }
+    if (pairing() && !rdFound && pairFirstSeen && millis() - pairFirstSeen > PAIR_WINDOW_MS) {
+      rdAddr = pairBest;
+      rdFound = true;
+      pairFirstSeen = 0;
+      pairBestRssi = -1000;
     }
     if (rdFound) appConnect();
     else if (!NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(0, false, true);
     return;
   }
+  if (haveSession && pairing()) saveRd(rdAddr);
   if (!haveSession && millis() - helloAt > 2000) appHello();
 }
 
-// В режиме приложения: нажатие переключает один раз, удержание повторяет переключение.
+// App mode: a press shifts once, a held button keeps shifting. Both buttons held for 5 s start pairing.
 void pollAppButton(Button &b) {
   uint32_t now = millis();
   bool down = digitalRead(b.pin) == LOW;
@@ -458,8 +513,16 @@ void pollAppButton(Button &b) {
     b.pressed = down;
     if (down) {
       b.pressedAt = b.repeatAt = now;
-      appShift(b.up);
+      b.holdSent = false;
+      if (!buttonUp.pressed || !buttonDown.pressed) appShift(b.up);
     }
+  }
+  if (buttonUp.pressed && buttonDown.pressed) {
+    if (b.up && !b.holdSent && now - max(buttonUp.pressedAt, buttonDown.pressedAt) > REPAIR_MS) {
+      b.holdSent = true;
+      forgetRd();
+    }
+    return;
   }
   if (b.pressed && now - b.pressedAt > HOLD_MS && now - b.repeatAt > REPEAT_MS) {
     b.repeatAt = now;
@@ -467,7 +530,7 @@ void pollAppButton(Button &b) {
   }
 }
 
-// Повторяет кадры настоящего пода: press, один hold после ~540 мс (так в записи 2026-10-23), release.
+// Pod mode: like the real pod, press, one hold after ~540 ms (recorded 2026-10-23), release.
 void pollButton(Button &b) {
   if (appMode) return pollAppButton(b);
   uint32_t now = millis();
@@ -478,7 +541,7 @@ void pollButton(Button &b) {
     if (down) {
       b.pressedAt = now;
       b.holdSent = false;
-      Serial.printf("Кнопка %s%s\n", b.up ? "ВВЕРХ" : "ВНИЗ", fineTune ? " (fine-tune)" : "");
+      Serial.printf("Button %s%s\n", b.up ? "UP" : "DOWN", fineTune ? " (fine-tune)" : "");
       sendCode(pressCode(b.up));
     } else {
       sendCode(b.up ? UP_RELEASED : DOWN_RELEASED);
@@ -491,7 +554,7 @@ void pollButton(Button &b) {
   }
 }
 
-// Меняет режим только когда переключатель сдвинули, чтобы команда f с Мака тоже работала.
+// Changes fine-tune only when the switch moves, so the f command still works.
 void pollFineSwitch() {
   static uint32_t changedAt = 0;
   static bool last = digitalRead(PIN_FINE) == LOW;
@@ -500,31 +563,44 @@ void pollFineSwitch() {
     changedAt = millis();
     last = t;
     fineTune = t;
-    Serial.printf("Переключатель: %s\n", fineTune ? "T (fine-tune)" : "R");
+    Serial.printf("Switch: %s\n", fineTune ? "T (fine-tune)" : "R");
   }
 }
 
-// Подключён RD: горит. Ждём RD: короткая вспышка раз в секунду.
+// Connected to the RD: steady. Searching: short flash once a second. Pairing: fast blinking.
 void updateLed() {
-  bool on = (appMode ? haveSession : rdConnected()) ? true : (millis() % 1000) < 60;
+  bool on;
+  if (pairing()) on = (millis() % 200) < 100;
+  else if (appMode ? haveSession : rdConnected()) on = true;
+  else on = (millis() % 1000) < 60;
   digitalWrite(PIN_LED, on ? LOW : HIGH);
 }
 
 void click(bool up) {
   if (appMode) return appShift(up);
-  Serial.printf("Передача %s%s\n", up ? "ВВЕРХ" : "ВНИЗ", fineTune ? " (fine-tune)" : "");
+  Serial.printf("Shift %s%s\n", up ? "UP" : "DOWN", fineTune ? " (fine-tune)" : "");
   sendCode(pressCode(up));
   delay(120);
   sendCode(up ? UP_RELEASED : DOWN_RELEASED);
 }
 
-// ---------- BLE-колбэки ----------
+// ---------- scanning ----------
 
 class ScanCB : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *d) override {
     if (appMode && !rdFound && !appConnected() && isRd(d)) {
-      rdAddr = d->getAddress();
-      rdFound = true;
+      if (!pairing()) {
+        if (d->getAddress() == NimBLEAddress(rdStr.c_str(), rdType)) {
+          rdAddr = d->getAddress();
+          rdFound = true;
+        }
+      } else {
+        if (!pairFirstSeen) pairFirstSeen = millis();
+        if (d->getRSSI() > pairBestRssi) {
+          pairBestRssi = d->getRSSI();
+          pairBest = d->getAddress();
+        }
+      }
     }
     if (!userScan) return;
     std::string m = d->getManufacturerData();
@@ -537,18 +613,18 @@ class ScanCB : public NimBLEScanCallbacks {
                   d->getAddress().getType() == BLE_ADDR_PUBLIC ? "public" : "random", d->getRSSI(),
                   d->haveName() ? ("  \"" + d->getName() + "\"").c_str() : "", wt ? "  <- WHEELTOP" : "");
     int off = wt ? prefixOffset((const uint8_t *)m.data(), m.size()) : -1;
-    if (off >= 0 && m.size() > (size_t)off + 7) Serial.printf("    тип 0x%02x %s\n", (uint8_t)m[off + 7], typeName(m[off + 7]));
+    if (off >= 0 && m.size() > (size_t)off + 7) Serial.printf("    type 0x%02x %s\n", (uint8_t)m[off + 7], typeName(m[off + 7]));
     if (!m.empty()) Serial.printf("    mfr: %s\n", hex((const uint8_t *)m.data(), m.size()).c_str());
     Serial.printf("    raw: %s\n", hex(d->getPayload().data(), d->getPayload().size()).c_str());
   }
   void onScanEnd(const NimBLEScanResults &r, int reason) override {
     if (!userScan) return;
     userScan = false;
-    Serial.printf("Скан окончен, найдено: %u\n", (unsigned)found.size());
+    Serial.printf("Scan finished, found: %u\n", (unsigned)found.size());
   }
 };
 
-// ---------- разбор GATT ----------
+// ---------- GATT dump ----------
 
 String props(const NimBLERemoteCharacteristic *c) {
   String s;
@@ -560,114 +636,125 @@ String props(const NimBLERemoteCharacteristic *c) {
   return s;
 }
 
-// Подключается к устройству как central и печатает все сервисы, характеристики и дескрипторы с хэндлами.
+// Connects to a device as a central and prints all services, characteristics and descriptors with handles.
 void dumpGatt(const NimBLEAddress &addr) {
   ble_gap_adv_stop();
   NimBLEClient *c = NimBLEDevice::createClient();
-  Serial.printf("Подключаюсь к %s…\n", addr.toString().c_str());
+  Serial.printf("Connecting to %s…\n", addr.toString().c_str());
   if (!c->connect(addr)) {
-    Serial.println("Не подключился");
+    Serial.println("Connection failed");
   } else {
     for (auto *svc : c->getServices(true)) {
-      Serial.printf("сервис %s  хэндлы 0x%04x-0x%04x\n", svc->getUUID().toString().c_str(), svc->getStartHandle(), svc->getEndHandle());
+      Serial.printf("service %s  handles 0x%04x-0x%04x\n", svc->getUUID().toString().c_str(), svc->getStartHandle(), svc->getEndHandle());
       for (auto *chr : svc->getCharacteristics(true)) {
-        Serial.printf("  хар-ка %s  значение 0x%04x [%s ]\n", chr->getUUID().toString().c_str(), chr->getHandle(), props(chr).c_str());
+        Serial.printf("  char %s  value 0x%04x [%s ]\n", chr->getUUID().toString().c_str(), chr->getHandle(), props(chr).c_str());
         if (chr->canRead()) {
           NimBLEAttValue v = chr->readValue();
           String text;
           for (size_t i = 0; i < v.size(); i++) text += isprint(v[i]) ? (char)v[i] : '.';
-          Serial.printf("    читается: %s  \"%s\"\n", hex(v.data(), v.size()).c_str(), text.c_str());
+          Serial.printf("    reads: %s  \"%s\"\n", hex(v.data(), v.size()).c_str(), text.c_str());
         }
         for (auto *dsc : chr->getDescriptors(true))
-          Serial.printf("    дескр %s  0x%04x\n", dsc->getUUID().toString().c_str(), dsc->getHandle());
+          Serial.printf("    desc %s  0x%04x\n", dsc->getUUID().toString().c_str(), dsc->getHandle());
       }
     }
     c->disconnect();
   }
   NimBLEDevice::deleteClient(c);
-  Serial.println("Разбор GATT окончен");
+  Serial.println("GATT dump finished");
   if (!appMode) startAdv();
 }
 
-// BLE_UUID16_DECLARE это составной литерал C, в C++ он не компилируется, поэтому UUID держим в NimBLEUUID.
+// BLE_UUID16_DECLARE is a C compound literal and doesn't compile in C++, so UUIDs live in NimBLEUUID.
 void showChr(const ble_uuid_t *svc, uint16_t chr, const char *name) {
   uint16_t def, val, cccd;
   NimBLEUUID c(chr), cccdUuid((uint16_t)0x2902);
   if (ble_gatts_find_chr(svc, c.getBase(), &def, &val) == 0) {
-    Serial.printf("  0x%04x %s: объявление 0x%04x, значение 0x%04x", chr, name, def, val);
+    Serial.printf("  0x%04x %s: declaration 0x%04x, value 0x%04x", chr, name, def, val);
     if (ble_gatts_find_dsc(svc, c.getBase(), cccdUuid.getBase(), &cccd) == 0) Serial.printf(", CCCD 0x%04x", cccd);
     Serial.println();
   }
 }
 
-// Свой GATT: ищем известные сервисы и характеристики, чтобы сравнить хэндлы с настоящим подом.
+// Our own GATT: find the known services and characteristics to compare handles with the real pod.
 void printLayout() {
   uint16_t h;
   NimBLEUUID gapUuid((uint16_t)0x1800), gattUuid((uint16_t)0x1801), cccdUuid((uint16_t)0x2902);
   const ble_uuid_t *gap = gapUuid.getBase(), *gatt = gattUuid.getBase();
-  if (ble_gatts_find_svc(gap, &h) == 0) Serial.printf("сервис 1800 (GAP) с 0x%04x\n", h);
-  showChr(gap, 0x2a00, "имя");
-  showChr(gap, 0x2a01, "внешний вид");
-  showChr(gap, 0x2a04, "параметры соединения");
-  showChr(gap, 0x2aa6, "разрешение адреса");
-  if (ble_gatts_find_svc(gatt, &h) == 0) Serial.printf("сервис 1801 (GATT) с 0x%04x\n", h);
+  if (ble_gatts_find_svc(gap, &h) == 0) Serial.printf("service 1800 (GAP) from 0x%04x\n", h);
+  showChr(gap, 0x2a00, "name");
+  showChr(gap, 0x2a01, "appearance");
+  showChr(gap, 0x2a04, "connection parameters");
+  showChr(gap, 0x2aa6, "address resolution");
+  if (ble_gatts_find_svc(gatt, &h) == 0) Serial.printf("service 1801 (GATT) from 0x%04x\n", h);
   showChr(gatt, 0x2a05, "service changed");
   showChr(gatt, 0x2b29, "client features");
   showChr(gatt, 0x2b2a, "database hash");
   showChr(gatt, 0x2b3a, "server features");
   NimBLEUUID svc(SERVICE_UUID), rd(RDWRITE_UUID), bt(BUTTONS_UUID);
-  if (ble_gatts_find_svc(svc.getBase(), &h) == 0) Serial.printf("сервис NUS с 0x%04x\n", h);
+  if (ble_gatts_find_svc(svc.getBase(), &h) == 0) Serial.printf("service NUS from 0x%04x\n", h);
   uint16_t def, val, cccd;
   if (ble_gatts_find_chr(svc.getBase(), rd.getBase(), &def, &val) == 0)
-    Serial.printf("  …0002: объявление 0x%04x, значение 0x%04x\n", def, val);
+    Serial.printf("  …0002: declaration 0x%04x, value 0x%04x\n", def, val);
   if (ble_gatts_find_chr(svc.getBase(), bt.getBase(), &def, &val) == 0) {
-    Serial.printf("  …0003: объявление 0x%04x, значение 0x%04x", def, val);
+    Serial.printf("  …0003: declaration 0x%04x, value 0x%04x", def, val);
     if (ble_gatts_find_dsc(svc.getBase(), bt.getBase(), cccdUuid.getBase(), &cccd) == 0) Serial.printf(", CCCD 0x%04x", cccd);
     Serial.println();
   }
 }
 
-// ---------- настройки ----------
+// ---------- settings ----------
+
+// Default pod advertisement with the paired RD's address in the last 6 bytes.
+std::vector<uint8_t> podMfr() {
+  std::vector<uint8_t> m = DEFAULT_MFR;
+  if (rdStr.length()) {
+    const uint8_t *a = NimBLEAddress(rdStr.c_str(), rdType).getVal();
+    memcpy(m.data() + m.size() - 6, a, 6);
+  }
+  return m;
+}
 
 void loadPrefs() {
   prefs.begin("wheeltop", false);
+  rdStr = prefs.getString("rd", "");
+  rdType = prefs.getUChar("rdtype", BLE_ADDR_RANDOM);
   size_t n = prefs.getBytesLength("mfr");
   if (n) {
     mfr.resize(n);
     prefs.getBytes("mfr", mfr.data(), n);
   } else {
-    mfr = DEFAULT_MFR;
+    mfr = podMfr();
   }
   macStr = prefs.getString("mac", "");
   macType = prefs.getUChar("atype", BLE_ADDR_PUBLIC);
-  appMode = prefs.getString("mode", "pod") == "app";
+  appMode = prefs.getString("mode", "app") == "app";
 }
 
 void restart() {
-  Serial.println("Перезагрузка…");
+  Serial.println("Restarting…");
   Serial.flush();
   delay(100);
   ESP.restart();
 }
 
 void printInfo() {
+  Serial.printf("Paired RD: %s\n", rdStr.length() ? rdStr.c_str() : "none");
+  Serial.printf("BLE address: %s%s\n", NimBLEDevice::getAddress().toString().c_str(),
+                macStr.length() ? " (custom)" : " (factory)");
   if (appMode) {
-    Serial.printf("Режим: приложение. RD подключён: %s, сеанс: %s, передача: %d\n", appConnected() ? "да" : "нет",
-                  haveSession ? "есть" : "нет", lastGear);
-    Serial.printf("BLE-адрес: %s\n", NimBLEDevice::getAddress().toString().c_str());
+    Serial.printf("Mode: app. RD connected: %s, session: %s, gear: %d\n", appConnected() ? "yes" : "no",
+                  haveSession ? "yes" : "no", lastGear);
     return;
   }
-  Serial.println("Режим: шифтер (под)");
-  Serial.printf("Тип пода: 0x%02x %s\n", podType(), typeName(podType()));
-  Serial.printf("Реклама (mfr): %s\n", hex(mfr.data(), mfr.size()).c_str());
-  Serial.printf("BLE-адрес: %s%s\n", NimBLEDevice::getAddress().toString().c_str(),
-                macStr.length() ? " (подменён)" : " (заводской)");
-  Serial.printf("RD подключён: %s, подписан: %s, fine-tune: %s, реклама: %s\n", rdConnected() ? "да" : "нет",
-                subscribers ? "да" : "нет", fineTune ? "вкл" : "выкл",
-                ble_gap_adv_active() ? "идёт" : "НЕ ИДЁТ");
+  Serial.println("Mode: pod");
+  Serial.printf("Pod type: 0x%02x %s\n", podType(), typeName(podType()));
+  Serial.printf("Advertisement (mfr): %s\n", hex(mfr.data(), mfr.size()).c_str());
+  Serial.printf("RD connected: %s, subscribed: %s, fine-tune: %s, advertising: %s\n", rdConnected() ? "yes" : "no",
+                subscribers ? "yes" : "no", fineTune ? "on" : "off", ble_gap_adv_active() ? "on" : "OFF");
 }
 
-// ---------- команды ----------
+// ---------- commands ----------
 
 void handle(String line) {
   line.trim();
@@ -682,29 +769,36 @@ void handle(String line) {
 
   if (cmd == "u") click(true);
   else if (cmd == "d") click(false);
-  else if (cmd == "f") {
+  else if (cmd == "pair") {
+    if (!appMode) { Serial.println("Pod mode: power the RD briefly, then press a board button within ~8 s"); return; }
+    forgetRd();
+  } else if (cmd == "mode") {
+    if (arg != "app" && arg != "pod") { Serial.println("mode app|pod"); return; }
+    prefs.putString("mode", arg);
+    restart();
+  } else if (cmd == "f") {
     fineTune = !fineTune;
-    Serial.printf("Fine-tune: %s\n", fineTune ? "вкл (T)" : "выкл (R)");
+    Serial.printf("Fine-tune: %s\n", fineTune ? "on (T)" : "off (R)");
   } else if (cmd == "s" || cmd == "a") {
     scanAll = cmd == "a";
     userScan = true;
     found.clear();
-    Serial.printf("Сканирую 5 с (%s)…\n", scanAll ? "все устройства" : "только WHEELTOP");
+    Serial.printf("Scanning 5 s (%s)…\n", scanAll ? "all devices" : "WHEELTOP only");
     NimBLEDevice::getScan()->start(5000, false, true);
   } else if (cmd == "clone") {
     int i = arg.toInt();
-    if (i < 1 || i > (int)found.size()) { Serial.println("Нет такого номера, сначала s"); return; }
+    if (i < 1 || i > (int)found.size()) { Serial.println("No such number, run s first"); return; }
     Found &f = found[i - 1];
-    if (f.mfr.empty()) { Serial.println("У устройства нет manufacturer data"); return; }
+    if (f.mfr.empty()) { Serial.println("The device has no manufacturer data"); return; }
     prefs.putBytes("mfr", f.mfr.data(), f.mfr.size());
     prefs.putString("mac", f.addr.toString().c_str());
     prefs.putUChar("atype", f.addr.getType());
-    Serial.printf("Скопировал %s. Выключи настоящий под, иначе адреса совпадут.\n", f.addr.toString().c_str());
+    Serial.printf("Copied %s. Turn off the real pod, or the addresses will clash.\n", f.addr.toString().c_str());
     restart();
   } else if (cmd == "type") {
     uint8_t t = arg == "ox" ? 0x37 : arg == "tx-front" ? 0x39 : arg == "tx-left" ? 0x36 : arg == "tx-right" ? 0x38 : 0;
     if (!t) { Serial.println("type ox|tx-front|tx-left|tx-right"); return; }
-    if (typeIndex() < 0) mfr = DEFAULT_MFR;
+    if (typeIndex() < 0) mfr = podMfr();
     mfr[typeIndex()] = t;
     prefs.putBytes("mfr", mfr.data(), mfr.size());
     restart();
@@ -727,8 +821,8 @@ void handle(String line) {
     sendFrame(d.data(), d.size());
   } else if (cmd == "gatt") {
     int i = arg.toInt();
-    if (i < 1 || i > (int)found.size()) { Serial.println("Нет такого номера, сначала s"); return; }
-    if (macStr.length()) { Serial.println("Сначала mac off: плата сейчас с адресом пода"); return; }
+    if (i < 1 || i > (int)found.size()) { Serial.println("No such number, run s first"); return; }
+    if (macStr.length()) { Serial.println("Run mac off first: the board uses a pod's address now"); return; }
     dumpGatt(found[i - 1].addr);
   } else if (cmd == "layout") {
     printLayout();
@@ -736,14 +830,10 @@ void handle(String line) {
     prefs.clear();
     restart();
   } else if (cmd == "log") {
-    Serial.print(eventLog.length() ? eventLog : String("событий нет\n"));
-    Serial.printf("Ключей сопряжения в памяти: %d\n", NimBLEDevice::getNumBonds());
-  } else if (cmd == "mode") {
-    if (arg != "app" && arg != "pod") { Serial.println("mode app|pod"); return; }
-    prefs.putString("mode", arg);
-    restart();
+    Serial.print(eventLog.length() ? eventLog : String("no events\n"));
+    Serial.printf("Bonding keys stored: %d\n", NimBLEDevice::getNumBonds());
   } else if (cmd == "info") printInfo();
-  else Serial.printf("Неизвестная команда: %s\n", line.c_str());
+  else Serial.printf("Unknown command: %s\n", line.c_str());
 }
 
 // ---------- setup / loop ----------
@@ -759,10 +849,10 @@ void setup() {
   fineTune = digitalRead(PIN_FINE) == LOW;
   loadPrefs();
 
-  // Публичный адрес подменяем до запуска Bluetooth, случайный задаём после init.
+  // A public address is replaced before Bluetooth starts, a random one after init.
   if (macStr.length() && macType == BLE_ADDR_PUBLIC) {
     std::vector<uint8_t> m = parseHex(macStr);
-    if (esp_iface_mac_addr_set(m.data(), ESP_MAC_BT) != ESP_OK) Serial.println("Не удалось подменить MAC");
+    if (esp_iface_mac_addr_set(m.data(), ESP_MAC_BT) != ESP_OK) Serial.println("Could not set the MAC");
   }
 
   NimBLEDevice::init("");
@@ -771,19 +861,20 @@ void setup() {
     NimBLEDevice::setOwnAddr(NimBLEAddress(macStr.c_str(), BLE_ADDR_RANDOM));
     ownAddrType = BLE_OWN_ADDR_RANDOM;
   }
-  // Разрешаем сопряжение без PIN: если RD его попросит, увидим это в логе.
+  // Allow pairing without a PIN: if the RD asks for it, the log shows it.
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   registerPodGatt();
-  if (!appMode) startAdv(); // в режиме приложения не рекламируемся: RD подключается к родному шифтеру
+  if (!appMode) startAdv(); // in app mode we don't advertise: the RD stays with the native shifter
 
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(new ScanCB(), false);
   scan->setActiveScan(true);
 
-  Serial.println("WHEELTOP pod emulator готов. Команды: u d f s a clone type mac raw reset info mode");
+  Serial.println("WHEELTOP board ready. Commands: u d pair mode info log reset | f type mac raw | s a clone gatt layout");
   printInfo();
+  if (pairing()) logEvent("Pairing: wake the derailleur (move the bike), keep the board close to it\n");
 }
 
 void loop() {
@@ -806,18 +897,18 @@ void loop() {
     ackPending = false;
     static const uint8_t none = 0;
     sendFrame(&none, 0, true);
-    logEvent("Ответ RD: пустой notify\n");
+    logEvent("Reply to RD: empty notify\n");
   }
-  // Связь могла появиться и без CONNECT (статус 26), поэтому время подключения ставим здесь
+  // The link may appear without CONNECT (status 26), so the connection time is set here.
   if (rdConnected() && connectedAt == 0) connectedAt = millis();
   if (rdConnected() && !paramsRequested && millis() - connectedAt > 1700) {
     paramsRequested = true;
     ble_gap_upd_params p = {};
-    p.itvl_min = 32;               // 40 мс
-    p.itvl_max = 64;               // 80 мс
+    p.itvl_min = 32;               // 40 ms
+    p.itvl_max = 64;               // 80 ms
     p.latency = 4;
-    p.supervision_timeout = 200;   // 2 с
+    p.supervision_timeout = 200;   // 2 s
     int rc = ble_gap_update_params(connHandle, &p);
-    logEvent("Запрос параметров 40–80 мс, latency 4: %d\n", rc);
+    logEvent("Requested 40–80 ms, latency 4: %d\n", rc);
   }
 }

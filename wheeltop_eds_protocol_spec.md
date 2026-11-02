@@ -1,440 +1,427 @@
-# WHEELTOP EDS: BLE-протокол шифтера (под) → хост
+# WHEELTOP EDS: BLE protocol of the shifter (pod), the rear derailleur and the app
 
-Неофициальная спецификация. Источник: reverse-engineering в проекте BikeControl,
-`lib/bluetooth/devices/wheeltop/wheeltop_eds.dart` и `wheeltop_probe.dart`
-(github.com/OpenBikeControl/bikecontrol, ветка main, прочитано 2026-10-05).
-Wheeltop официальной документации не публикует. Всё ниже взято из кода BikeControl,
-а не проверено на железе.
+An unofficial specification, written as a research log: later sections correct earlier ones.
+Wheeltop publishes no documentation.
 
-## 0. Что это описывает и что нет
+**Summary of what works (2026-11-03):**
 
-- Описано: **под (шифтер на руле) выступает BLE-периферией и шлёт события кнопок**.
-- Не описано: что именно делает задний переключатель (RD) и как он отвечает.
-  В коде прямо сказано, что ответ RD на статус-кадр неизвестен.
-- Под принимает центрального (central) только тогда, когда RD его не «занял».
-  Значит, в штатной системе **RD является central, а под является peripheral**.
-- Отсюда вывод для задачи «управлять переключателем без пода»: нужно не
-  отправлять команды на RD, а **эмулировать под**. Эмулятор рекламируется как
-  периферия и шлёт RD кадры кнопок. Это гипотеза, на железе она не проверена.
+- The rear derailleur (RD, advertises as `EDS OX2`) is a BLE central to its shifter (pod) and at the same time
+  a peripheral to the Wheeltop phone app. The app protocol (section 19) shifts gears while the shifter stays
+  paired; `esp32/wheeltop_pod` in app mode uses it.
+- A board can also replace the shifter by emulating the pod (sections 10, 15, 17).
 
-## 1. Реклама (advertisement)
+Sections 0–8 come from reading the BikeControl source:
+`lib/bluetooth/devices/wheeltop/wheeltop_eds.dart` and `wheeltop_probe.dart`
+(github.com/OpenBikeControl/bikecontrol, main branch, read 2026-10-05). Sections 9 and later are hardware tests.
 
-Manufacturer-specific data. Имени BLE у пода нет. Байты считаются от начала
-manufacturer data. Первые два байта (`07 0f`) на части платформ отдаются как
-little-endian company id, на части остаются в payload.
+Addresses of the author's devices are not published. Where they matter, the text says "the pod's address"
+or "the RD's address".
 
-| Смещение | Длина | Значение |
+## 0. What this describes and what it doesn't
+
+- Described: **the pod (handlebar shifter) acts as a BLE peripheral and sends button events**.
+- Not described (in BikeControl): what the rear derailleur (RD) does and how it replies.
+  The code says outright that the RD's reply to the status frame is unknown.
+- The pod accepts a central only while the RD hasn't "claimed" it.
+  So in the stock system **the RD is the central and the pod is the peripheral**.
+- Conclusion for "control the derailleur without the pod": don't send commands to the RD,
+  **emulate the pod**. The emulator advertises as a peripheral and sends the RD button frames.
+  (Hypothesis at this point; confirmed in section 10.)
+
+## 1. Advertisement
+
+Manufacturer-specific data. The pod has no BLE name. Offsets count from the start of the manufacturer data.
+On some platforms the first two bytes (`07 0f`) are reported as a little-endian company id, on others
+they stay in the payload (corrected in section 9: there is a company id `ff ff` before them).
+
+| Offset | Length | Value |
 |---|---|---|
-| 0..6 | 7 | Константный префикс `07 0f 00 14 55 6a 84` |
-| 7 | 1 | Тип устройства (см. ниже) |
-| 8 | 2 | Версия прошивки: major, minor (необязательно) |
-| 10 | 2 | Напряжение батареи, big-endian, вольты × 100 (например, 292 = 2.92 В) (необязательно) |
+| 0..6 | 7 | Constant prefix `07 0f 00 14 55 6a 84` |
+| 7 | 1 | Device type (below) |
+| 8 | 2 | Firmware version: major, minor (optional) |
+| 10 | 2 | Battery voltage, big-endian, volts × 100 (e.g. 292 = 2.92 V) (optional) |
 
-Версия и батарея читаются, только если длина больше 11 байт.
+Version and battery are read only if the data is longer than 11 bytes.
 
-Типы устройств:
+Device types:
 
-| Байт | Вариант |
+| Byte | Variant |
 |---|---|
 | `0x37` | OX |
 | `0x39` | TX Front |
 | `0x36` | TX Left |
 | `0x38` | TX Right |
 
-Все варианты используют один и тот же протокол кнопок.
+All variants use the same button protocol.
 
 ## 2. GATT
 
 Nordic UART Service (NUS):
 
-| Роль | UUID |
+| Role | UUID |
 |---|---|
 | Service | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` |
-| Характеристика событий кнопок (notify) | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
-| Вероятный слот для записи от RD | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
+| Button events (notify) | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
+| Probable slot for writes from the RD | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
 
-- В стандартном NUS 6e400002 это RX (запись), а 6e400003 это TX (notify).
-  Wheeltop использует их **наоборот**: кнопки приходят notify на `…0002`.
-- Клиент BikeControl подписывается на **все** notify/indicate-характеристики
-  сервиса, потому что неизвестно, где под ждёт ответ.
-- Кнопочные события принимаются только с `…0002`.
-  Прочие слоты принимаются, только если на них была подписка.
-- Для записи (keepalive-проба) перебираются все writable-характеристики,
-  `…0003` первой.
+- In standard NUS 6e400002 is RX (write) and 6e400003 is TX (notify). BikeControl says Wheeltop uses them
+  **the other way round**, buttons arriving as notify on `…0002` (wrong, see section 9).
+- The BikeControl client subscribes to **all** notify/indicate characteristics of the service, since it doesn't
+  know where the pod expects a reply.
+- Button events are accepted only from `…0002`; other slots only if subscribed.
+- For writes (keepalive probe) all writable characteristics are tried, `…0003` first.
 
-## 3. Формат кадров (подтверждённый, входящие от пода)
+## 3. Frame format (confirmed, from the pod)
 
-Первый байт всегда `0x04` (PACKET_PREFIX). Есть две формы:
+The first byte is always `0x04` (PACKET_PREFIX). Two forms:
 
-**OX, 3 байта:** `04 code xor`, где `xor = 0x04 ^ code`.
+**OX, 3 bytes:** `04 code xor`, where `xor = 0x04 ^ code`.
 
-**TX, 4 байта:** `04 type code sum`, где
-- `type` это байт типа из рекламы (`0x36..0x39`, другие значения кадр делают невалидным),
+**TX, 4 bytes:** `04 type code sum`, where
+- `type` is the type byte from the advertisement (`0x36..0x39`; other values make the frame invalid),
 - `sum = (0x04 + type + code) & 0xff`.
 
-Для кодов без установленного бита 2 обе контрольные суммы дают одинаковый
-результат (комментарий в коде). Кадр, не прошедший проверку, игнорируется.
+For codes without bit 2 set both checksums give the same result (a comment in the code).
+A frame that fails the check is ignored.
 
-### Пример (посчитано по формулам, не из логов)
+### Example (computed from the formulas, not from logs)
 
-| Событие | OX (3 байта) | TX Right, type=0x38 (4 байта) |
+| Event | OX (3 bytes) | TX Right, type=0x38 (4 bytes) |
 |---|---|---|
 | Top pressed (`0x02`) | `04 02 06` | `04 38 02 3e` |
 | Top released (`0x0a`) | `04 0a 0e` | `04 38 0a 46` |
 | Bottom pressed (`0x01`) | `04 01 05` | `04 38 01 3d` |
 
-## 4. Коды (opcodes)
+## 4. Codes
 
-| Код | Значение | Как обрабатывает BikeControl |
+| Code | Meaning | BikeControl handling |
 |---|---|---|
-| `0x01` | Нижняя кнопка нажата (shift down) | нажатие |
-| `0x02` | Верхняя кнопка нажата (shift up) | нажатие |
-| `0x03` | Нижняя удерживается | игнор (повтор каждые ~500 мс) |
-| `0x04` | Верхняя удерживается | игнор |
-| `0x05` | Нижняя нажата, режим fine-tune | нажатие |
-| `0x06` | Верхняя нажата, режим fine-tune | нажатие |
-| `0x07` | Нижняя удерживается, fine-tune | игнор |
-| `0x08` | Верхняя удерживается, fine-tune | игнор |
-| `0x09` | Нижняя отпущена | отпускание (общий код для R и T) |
-| `0x0a` | Верхняя отпущена | отпускание (общий код для R и T) |
-| `0x10` | Статус/«hello»-кадр TX-прошивки | см. раздел 5 |
+| `0x01` | Bottom button pressed (shift down) | press |
+| `0x02` | Top button pressed (shift up) | press |
+| `0x03` | Bottom held | ignored (repeats every ~500 ms) |
+| `0x04` | Top held | ignored |
+| `0x05` | Bottom pressed, fine-tune mode | press |
+| `0x06` | Top pressed, fine-tune mode | press |
+| `0x07` | Bottom held, fine-tune | ignored |
+| `0x08` | Top held, fine-tune | ignored |
+| `0x09` | Bottom released | release (same code for R and T) |
+| `0x0a` | Top released | release (same code for R and T) |
+| `0x10` | Status/"hello" frame of the TX firmware | see section 5 |
 
-На поде две физические кнопки и ползунок. Положение «R» даёт обычные коды
-`0x01/0x02`, положение «T» даёт fine-tune-коды `0x05/0x06`.
-Под **не знает** текущей передачи, он только сообщает состояние кнопок.
+The pod has two physical buttons and a slider. Position "R" gives the normal codes `0x01/0x02`,
+position "T" gives the fine-tune codes `0x05/0x06`. The pod **doesn't know** the current gear;
+it only reports button states.
 
-Типичная последовательность одного нажатия: press (`01`/`02`),
-затем повторы hold (`03`/`04`) каждые ~500 мс, затем release (`09`/`0a`).
+A typical press: press (`01`/`02`), then hold repeats (`03`/`04`) every ~500 ms, then release (`09`/`0a`).
+Other valid codes aren't described; an unknown code is just logged.
 
-Другие валидные коды в коде не описаны. Неизвестный код просто логируется.
+## 5. Status frame and keepalive (TX firmware)
 
-## 5. Статус-кадр и keepalive (TX-прошивка)
-
-- TX-под шлёт `04 type 10 sum` с частотой 1 Гц, начиная примерно через
-  ~300 мс после соединения.
-- Если ответа нет, **под разрывает связь после трёх кадров**.
-- Правильный ответ неизвестен. BikeControl перебирает кандидатов, по одному
-  на каждое подключение, и логирует, пережило ли соединение 5 с:
-  1. `04 type 10 sum` (эхо)
+- A TX pod sends `04 type 10 sum` at 1 Hz, starting about 300 ms after connecting.
+- Without a reply **the pod drops the connection after three frames**.
+- The correct reply is unknown. BikeControl tries candidates, one per connection, and logs whether the
+  connection survived 5 s:
+  1. `04 type 10 sum` (echo)
   2. `04 type 11 sum` (code+1)
-  3. `04 type 0f sum` (опкод `0x0f` «из полевого лога»)
-  4. `04 10 14` (3 байта, XOR, эхо)
-  5. `04 11 15` (3 байта, XOR, ack)
-  6. `09 01 00 00` (ответ пода, наблюдавшийся в логе, дословно)
+  3. `04 type 0f sum` (opcode `0x0f` "from a field log")
+  4. `04 10 14` (3 bytes, XOR, echo)
+  5. `04 11 15` (3 bytes, XOR, ack)
+  6. `09 01 00 00` (a pod reply seen in a log, verbatim)
   7. `01`
-- Из комментариев в коде следует: опкод `0x0f` и кадр `09 01 00 00` наблюдались
-  в трафике. Откуда именно (RD, под?) в коде не сказано.
-- Для OX-прошивки статус-кадр в коде не упомянут, и такая проблема там не
-  описана.
-- Результаты пробы в исходниках не зафиксированы. Какой кандидат работает,
-  неизвестно.
+- The comments imply opcode `0x0f` and frame `09 01 00 00` were seen in traffic, but not from which side.
+- For the OX firmware no status frame is mentioned.
+- The probe results aren't recorded in the source.
 
-## 6. Поведение подключения
+(Section 17: the real pod sends no status frames to the RD at all.)
 
-- Под принимает central, только если RD его не занял: когда RD подключён, телефон не
-  может подключиться (подсказка в UI: `wheeltopClaimedByDerailleurHint`).
-  Автоподключение BikeControl сдаётся после 3 попыток.
-- При обрыве соединения в удержании release может не прийти, поэтому состояние
-  «нажато» нужно сбрасывать при дисконнекте.
+## 6. Connection behaviour
 
-## 7. Что неизвестно (нужно выяснять на железе)
+- The pod accepts a central only if the RD hasn't claimed it: while the RD is connected, a phone can't connect
+  (UI hint `wheeltopClaimedByDerailleurHint`). BikeControl's auto-connect gives up after 3 attempts.
+- If the connection drops during a hold, the release may never arrive, so the "pressed" state should be reset
+  on disconnect.
 
-1. Нужен ли bonding/pairing между RD и подом (и ключи, если да).
-2. Как RD находит под: по префиксу рекламы, по MAC, по привязке в приложении Wheeltop.
-3. Что RD шлёт поду после подключения (запись на `…0003`?) и что ожидает на статус-кадры TX.
-4. Принимает ли RD кадры от эмулятора без привязки.
-5. Как приложение Wheeltop привязывает под к RD и настраивает передачи
-   (отдельный протокол, в BikeControl не затронут).
-6. ANT+-режим (Garmin) описан только на уровне маркетинга.
+## 7. Open questions at the start
 
-## 8. План проверки гипотезы «эмулировать под»
+1. Is bonding/pairing needed between the RD and the pod (and keys, if so)?
+2. How does the RD find the pod: by the advertisement prefix, by MAC, by a binding made in the Wheeltop app?
+3. What does the RD send the pod after connecting, and what does it expect for TX status frames?
+4. Does the RD accept frames from an emulator without a binding?
+5. How does the Wheeltop app bind a pod to an RD and configure gears (a separate protocol)?
+6. ANT+ mode (Garmin) is only described in marketing.
 
-1. Взять ESP32 (NimBLE) или телефон/ПК, способный быть BLE-периферией.
-2. Поднять NUS с теми же UUID и рекламировать manufacturer data с префиксом
-   и типом `0x37` (OX, нет статус-кадра). Для пробы начать с OX-варианта.
-3. После подключения RD слать notify на `…0002` кадры `04 02 06` (вверх)
-   и `04 0a 0e` (отпустить).
-4. Параллельно снять трафик настоящей пары под+RD (nRF Sniffer или HCI snoop log),
-   чтобы сверить рекламу и все записи RD.
-5. Если RD не принимает эмулятор, вероятно, нужна привязка или bonding, и нужен захват
-   процесса сопряжения.
+## 8. Plan to test "emulate the pod"
 
-## 9. Проверено на железе (2026-10-23)
+1. Take an ESP32 (NimBLE) or a phone/PC that can be a BLE peripheral.
+2. Bring up NUS with the same UUIDs and advertise manufacturer data with the prefix and type `0x37`
+   (OX, no status frame).
+3. After the RD connects, send notify frames `04 02 06` (up) and `04 0a 0e` (release).
+4. Record the real pod+RD traffic to compare advertisements and RD writes.
+5. If the RD rejects the emulator, a binding or bonding is probably needed; record pairing.
 
-Мак подключился к настоящему поду как central (`mac/wheeltop-shifter --listen`, лог `mac/capture.log`),
-пока RD спал. Это исправляет и уточняет разделы выше.
+## 9. Hardware check (2026-10-23)
 
-**Устройство:** TX Right (`0x38`), прошивка 5.7, батарея 3.30 В.
+The Mac connected to a real pod as a central (`mac/wheeltop-shifter --listen`) while the RD was asleep.
+This corrects sections above.
 
-**Реклама.** Manufacturer data (как её отдаёт macOS, вместе с company id):
+**Device:** TX Right (`0x38`), firmware 5.7, battery 3.30 V.
+
+**Advertisement.** Manufacturer data as macOS reports it, with the company id:
 
 ```
-ff ff 07 0f 00 14 55 6a 84 38 05 07 01 4a 90 6a 00 03 00 00 00 00 e0
+ff ff 07 0f 00 14 55 6a 84 38 05 07 01 4a 90 6a 00 <RD address, 6 bytes little-endian>
 ```
 
-- Company id `ff ff`, а **префикс `07 0f 00 14 55 6a 84` идёт после него**, со смещения 2.
-  Смещения из раздела 1 отсчитываются от начала префикса.
-- После батареи есть ещё 9 байт: `90 6a 00 03 00 00 00 00 e0`. Назначение неизвестно
-  (серийный номер? привязка к RD?).
-- Имени и UUID сервисов в рекламе нет, `connectable` = 1.
-- Под рекламируется после нажатия кнопки и после каждого разрыва связи (примерно через 0,4 с).
+- Company id `ff ff`; **the prefix `07 0f 00 14 55 6a 84` follows it**, at offset 2.
+  Offsets in section 1 count from the start of the prefix.
+- After the battery there are 9 more bytes: `90 6a 00` and 6 bytes that turned out to be the paired RD's
+  address (section 11).
+- No name or service UUIDs in the advertisement; connectable.
+- The pod advertises after a button press and after every disconnect (about 0.4 s later).
 
-**GATT. Роли характеристик как в стандартном NUS, а не наоборот (раздел 2 ошибался):**
+**GATT. The characteristic roles are as in standard NUS, not reversed (section 2 was wrong):**
 
-| UUID | Свойства | Роль |
+| UUID | Properties | Role |
 |---|---|---|
-| `6e400002-…` | write, write without response | запись от central (RD) |
-| `6e400003-…` | notify | кадры кнопок и статус-кадры |
+| `6e400002-…` | write, write without response | written by the central (RD) |
+| `6e400003-…` | notify | button frames and status frames |
 
-Других сервисов и характеристик нет.
+No other services or characteristics.
 
-**Кадры.** Совпали с формулами раздела 3 для TX: `04 38 code sum`. Наблюдались коды
-`01`, `02`, `04` (удержание верхней), `09`, `0a`, `10`. Fine-tune-коды не снимались (ползунок в T не переводили).
+**Frames.** Match the TX formulas of section 3: `04 38 code sum`. Codes seen: `01`, `02`, `04` (top held),
+`09`, `0a`, `10`. Fine-tune codes weren't captured.
 
-**Статус-кадр.** `04 38 10 4c` примерно раз в 1,02 с, первый через ~0,4–0,9 с после подписки.
-Без ответа под рвёт связь через ~3,6 с, то есть после трёх статус-кадров. Нажатия кнопок связь не продлевают.
-Правильный ответ всё ещё неизвестен.
+**Status frame.** `04 38 10 4c` about every 1.02 s, the first ~0.4–0.9 s after subscribing.
+Without a reply the pod drops the connection after ~3.6 s, i.e. after three status frames. Button presses don't
+extend it. The correct reply is still unknown (to the Mac; the RD gets no status frames, section 17).
 
-## 10. Эмуляция пода работает (2026-10-23)
+## 10. Pod emulation works (2026-10-23)
 
-Гипотеза «эмулировать под» подтвердилась: RD переключает передачи по командам с Мака через
-ESP32-C3 (`esp32/wheeltop_pod`, управление `mac/wheeltop-shifter --esp32`). Нажато 22 раза, все кадры дошли.
+Confirmed: the RD shifts on commands from the Mac through an ESP32-C3 (`esp32/wheeltop_pod`, controlled by
+`mac/wheeltop-shifter --esp32`). 22 presses, all frames arrived.
 
-Что для этого понадобилось:
+What it took:
 
-- **Адрес настоящего пода**: `c0:00:00:00:00:01`, random static. RD подключается именно к нему.
-  Bonding и сопряжение не понадобились.
-- **Реклама один в один**: только manufacturer data (`18 ff ff ff 07 0f …`), без флагов и без ответа на скан.
-- **GATT как у пода**: сначала `…0002` (write, write-nr), потом `…0003` (notify), кнопки идут notify на `…0003`.
-- **Реклама сразу после разрыва связи**: RD подключился через ~0,5 с после старта платы.
+- **The real pod's address** (random static). The RD connects to exactly that address. No bonding or pairing.
+- **The advertisement byte for byte**: only manufacturer data (`18 ff ff ff 07 0f …`), no flags, no scan response.
+- **GATT like the pod's**: `…0002` (write, write-nr) first, then `…0003` (notify); buttons go as notify on `…0003`.
+- **Advertising right after a disconnect**: the RD connected ~0.5 s after the board started.
 
-Наблюдения:
+Observations:
 
-- От RD за сессию не пришло ни одной записи на `…0002`, хотя плата слала статус-кадры раз в секунду.
-  Плата сама связь не рвёт, поэтому для эмуляции ответ на статус-кадр не нужен.
-  Отвечает ли RD настоящему поду и как тот держит связь с RD, по-прежнему неизвестно.
-- macOS кэширует GATT по адресу: Мак, подключившись к плате после настоящего пода, писал подписку
-  по старому хэндлу. RD так себя не вёл.
-- Перед проверкой настоящий под нужно унести подальше: у него и у платы один адрес.
+- The RD wrote nothing to `…0002` during the session, though the board sent status frames every second.
+  The board doesn't drop the link itself, so emulation needs no status-frame reply.
+- macOS caches GATT by address: connecting to the board after the real pod, the Mac subscribed using the old handle.
+  The RD didn't behave like that.
+- The real pod must be far away during the test: it has the same address as the board.
 
-## 11. Реклама RD и привязка пода (2026-10-23)
+## 11. RD advertisement and pod binding (2026-10-23)
 
-ESP32 увидела сам RD, пока тот не спал и не был подключён к плате:
+The ESP32 saw the RD itself while it was awake and not connected to the board:
 
 ```
-адрес e0:00:00:00:00:03 (random), имя "EDS OX2"
-mfr: ff ff e0 00 00 00 00 03 52 04 23 50 cc 22 00 00
+address <RD address> (random), name "EDS OX2"
+mfr: ff ff <RD address, 6 bytes in display order> 52 04 23 50 cc 22 00 00
 ```
 
-- RD рекламируется с именем `EDS OX2`. В manufacturer data после company id `ff ff` идёт его собственный адрес.
-- **Хвост рекламы пода содержит адрес RD задом наперёд**: `90 6a 00 | 03 00 00 00 00 e0`
-  это `e0:00:00:00:00:03` в little-endian. Под объявляет, к какому RD он привязан.
-  `90 6a 00` пока неизвестно.
-- Остальные байты рекламы RD (`52 04 23 50 cc 22 00 00`) пока неизвестны.
+- The RD advertises with the name `EDS OX2`. Its manufacturer data carries its own address after company id `ff ff`.
+- **The tail of the pod's advertisement is the RD's address reversed** (little-endian):
+  the pod announces which RD it is bound to. `90 6a 00` before it is still unknown.
+- The other bytes of the RD advertisement (`52 04 23 50 cc 22 00 00`) are unknown (see also section 18).
 
-## 12. Потеря сопряжения (2026-10-23)
+## 12. Lost pairing (2026-10-23)
 
-После опытов с платой, которая рекламировалась с адресом пода, настоящий под перестал управлять RD:
-индикатор пода горел красным, а RD всё время рекламировался как `EDS OX2` и не подключался ни к поду, ни к плате.
-Повторное сопряжение по инструкции Wheeltop вернуло работу.
+After experiments with a board advertising with the pod's address, the real pod stopped controlling the RD:
+the pod's LED was red, and the RD advertised as `EDS OX2` all the time without connecting to the pod or the board.
+Re-pairing by Wheeltop's instructions fixed it.
 
-- `EDS OX2` в эфире не признак режима сопряжения: после повторного сопряжения, когда всё работало,
-  Мак видел в эфире одновременно и рекламу RD `EDS OX2`, и рекламу пода.
-- Что сбросило сопряжение, неизвестно. Подозрение: плата и под одновременно в эфире с одним адресом.
-  Держать под без батарейки, пока работает плата.
-- После повторного сопряжения реклама пода **не изменилась** (те же 23 байта, тот же адрес RD в хвосте),
-  поэтому плату заново копировать не нужно.
-- После повторного сопряжения и с вынутой батарейкой пода RD подключился к плате сразу после её включения,
-  без раскачивания велосипеда, и передача по команде с Мака переключилась (22:06–22:07).
+- `EDS OX2` on air is not a sign of pairing mode: after re-pairing, with everything working, the Mac saw both
+  the RD's `EDS OX2` advertisement and the pod's.
+- Cause unknown at this point. Suspect: the board and the pod on air at once with the same address.
+  Keep the pod without its battery while the board runs.
+- Re-pairing **didn't change** the pod's advertisement (same 23 bytes, same RD address in the tail),
+  so the board needn't copy it again.
+- After re-pairing, with the pod's battery out, the RD connected to the board right after power-up without
+  moving the bike, and a shift commanded from the Mac worked.
 
-## 13. GATT пода с хэндлами (снято платой 2026-10-23)
+## 13. Pod GATT with handles (read by the board, 2026-10-23)
 
-| Хэндл | Что | Значение |
+| Handle | What | Value |
 |---|---|---|
-| `0x0001` | сервис 1800 (GAP), до `0x0009` | |
-| `0x0003` | 2A00 имя, read/write | `"EDS TX"` |
-| `0x0005` | 2A01 внешний вид, read | `00 00` |
-| `0x0007` | 2A04 параметры соединения, read | `20 00 40 00 04 00 c8 00` (40–80 мс, latency 4, таймаут 2 с) |
-| `0x0009` | 2AA6 разрешение адреса, read | `01` |
-| `0x000a` | сервис 1801 (GATT), **пустой** | |
-| `0x000b` | сервис NUS | |
+| `0x0001` | service 1800 (GAP), up to `0x0009` | |
+| `0x0003` | 2A00 name, read/write | `"EDS TX"` |
+| `0x0005` | 2A01 appearance, read | `00 00` |
+| `0x0007` | 2A04 connection parameters, read | `20 00 40 00 04 00 c8 00` (40–80 ms, latency 4, timeout 2 s) |
+| `0x0009` | 2AA6 central address resolution, read | `01` |
+| `0x000a` | service 1801 (GATT), **empty** | |
+| `0x000b` | NUS service | |
 | `0x000d` | `…0002` write, write-nr | |
 | `0x000f` | `…0003` notify | |
-| `0x0010` | CCCD для `…0003` | |
+| `0x0010` | CCCD of `…0003` | |
 
-У NimBLEServer раскладка другая (NUS с `0x000e`, CCCD кнопок на `0x0013`, в 1801 три характеристики).
-Если RD пишет по запомненным хэндлам пода, на такой плате подписка `0x0010` попадает в `…0002`,
-а запись `0x000d` в характеристику GATT «client supported features». Подозрение: из-за этого RD теряет сопряжение.
-Плата переделана: таблица GATT собрана вручную и совпадает с подом хэндл в хэндл.
+NimBLEServer lays this out differently (NUS from `0x000e`, the buttons' CCCD at `0x0013`, three characteristics
+in 1801). If the RD writes to the pod's remembered handles, on such a board the subscription to `0x0010` lands
+in `…0002` and the write to `0x000d` in GATT "client supported features". Suspected cause of lost pairing.
+The board was changed: its GATT table is built by hand and matches the pod handle for handle.
 
-## 14. Третья потеря сопряжения (2026-10-23, 22:30)
+## 14. Third lost pairing (2026-10-23)
 
-После повторного сопряжения (~22:20) было: плата подключилась к **настоящему поду** как central и сняла его GATT (22:22),
-затем батарейку пода вынули, плата с заводским адресом проверялась с Маком (22:28), затем плате вернули адрес пода (22:32).
-RD проснулся и больше минуты был в эфире, но к плате не подключился. Под с батарейкой горит красным и не переключает,
-то есть сопряжение слетело ещё до 22:32.
+After re-pairing: the board connected to the **real pod** as a central and read its GATT; then the pod's battery
+was removed, the board was tested with the Mac on its factory address, then given the pod's address again.
+The RD woke up and stayed on air for over a minute but didn't connect to the board. The pod with its battery
+was red and didn't shift, so pairing was lost before the board got the pod's address back.
 
-- Реклама красного пода та же самая: те же 23 байта, тот же адрес RD в хвосте. По рекламе пода потерю не видно.
-- Реклама RD в разное время: `52 04 23 50 bc 22 00 0f`, `… cc 22 00 00`, `… ac 22 00 00` (красный под). Что значат байты, неизвестно.
-- Главный подозреваемый: чужое подключение к поду (снятие GATT платой, раньше `--listen` с Мака).
-  Плата, к которой RD не подключался, вряд ли могла что-то сломать.
-- Проверка: после повторного сопряжения ничего не подключать к поду, сразу проверить плату.
+- The red pod's advertisement was the same 23 bytes. Lost pairing isn't visible in the pod's advertisement.
+- The RD's advertisement at different times: `52 04 23 50 bc 22 00 0f`, `… cc 22 00 00`, `… ac 22 00 00` (red pod).
+- Main suspect: a foreign connection to the pod (the board reading its GATT, earlier `--listen` from the Mac).
 
-## 15. Почему слетало сопряжение и что исправлено (2026-10-23, 22:50)
+## 15. Why pairing was lost and the first fix (2026-10-23)
 
-Журнал событий в памяти платы (команда `log`) показал первое подключение RD после включения платы:
+The board's event log (`log` command) showed the RD's first connection after the board started:
 
 ```
-1237 мс: MTU 247
-1567 мс: CONNECT от e0:00:00:00:00:03, статус 26 (BLE_HS_EENCRYPT_KEY_SZ), но связь есть
-1667 мс: LINK_ESTAB (38)
-2167 мс: подписка на 0x000f, notify=1
-2267 мс: ЗАПИСЬ от RD -> 0x000d: 03 01 00 00 01 01 03 22 00 00 00 00 00 00 00 00 00 00 00 00
+1237 ms: MTU 247
+1567 ms: CONNECT from <RD address>, status 26 (BLE_HS_EENCRYPT_KEY_SZ), but the link is up
+1667 ms: LINK_ESTAB (38)
+2167 ms: subscription to 0x000f, notify=1
+2267 ms: WRITE by RD -> 0x000d: 03 01 00 00 01 01 03 22 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
-- Шифрования и сопряжения на уровне BLE нет: событий ENC_CHANGE нет, ключей в памяти платы 0.
-- CONNECT приходит с ненулевым статусом, хотя связь установлена. Старая прошивка считала это неудачей:
-  не запоминала соединение, не слала статус раз в секунду и снова включала рекламу с адресом пода при живой связи.
-  Вероятно, именно это RD считал поломкой сопряжения. Теперь соединение берётся из CONNECT, MTU или SUBSCRIBE, если оно есть.
-- RD сразу после подписки пишет 20 байт в `…0002`. Значение пока неизвестно.
-- После исправления передача по команде с платы переключилась (22:49).
-- Но после выключения платы RD к ней не вернулся (бодрствует, в эфире, не подключается), а настоящий под горит красным.
-  Значит, сессия с платой ломает сопряжение даже тогда, когда передачи переключаются.
-- Главная версия: 20 байт от RD (`03 01 00 00 01 01 03 22 …`) это запрос, на который настоящий под отвечает,
-  а плата молчит. Ответа нет ни в коде BikeControl, ни в наших логах. Его нужно подслушать в настоящей сессии RD↔под.
-- Потеря №3 (22:22) случилась без подключения RD к плате, сразу после того как плата подключилась к поду как central.
-  Похоже, чужое подключение к поду тоже ломает сопряжение.
+- No BLE encryption or pairing: no ENC_CHANGE events, 0 keys stored.
+- CONNECT arrives with a non-zero status although the link is up. The old firmware treated it as a failure:
+  it didn't record the connection, didn't send status frames, and restarted advertising with the pod's address
+  while connected. Now the connection is taken from CONNECT, MTU or SUBSCRIBE, whichever shows it.
+- Right after subscribing the RD writes 20 bytes to `…0002`. Meaning unknown.
+- After the fix a shift commanded from the board worked.
+- But after switching the board off, the RD didn't come back to it, and the real pod was red.
+  So a session with the board broke pairing even when shifting worked.
+- Main theory: the 20 bytes from the RD are a request the real pod answers and the board didn't.
+  It had to be sniffed in a real RD↔pod session.
+- Loss no. 3 happened without the RD connecting to the board, right after the board connected to the pod
+  as a central. A foreign connection to the pod seems to break pairing too.
 
-## 16. Сниффер: как переключатель подключается к шифтеру (2026-11-02)
+## 16. Sniffer: how the RD connects to the pod (2026-11-02)
 
-Записи `mac/sniff3…10.pcapng`, свисток nRF52840 с nRF Sniffer 5.0.0.
+Captured with an nRF52840 dongle running nRF Sniffer 5.0.0.
 
-Запрос на соединение (CONNECT_IND) от RD `e0:00:00:00:00:03` к шифтеру `c0:00:00:00:00:01`.
-В двух записях без слежения (`sniff8`, `sniff10`) он пришёл с правильной CRC, и параметры там одинаковые:
+CONNECT_IND from the RD to the pod. In two captures without following it arrived with a good CRC and the same
+parameters: TxAdd Random, RxAdd Public, CSA #1, 1M, window 5, offset 0, interval 24 (30 ms), latency 0,
+timeout 400 (4 s), channel map `1f ff 00 00 00`, **hop 0**.
 
-- TxAdd Random, RxAdd **Public**, хотя шифтер рекламирует себя как random.
-- CSA #1, LE 1M, окно 5 (6,25 мс), смещение 0, интервал 24 (30 мс), latency 0, таймаут 400 (4 с).
-- Карта каналов `1f ff 00 00 00`: только каналы данных 0–4 и 8–15, всего 13.
-- **Hop = 0.** По стандарту допустимо только 5–16. При CSA #1 и hop 0 следующий канал всегда (0 + 0) mod 37 = 0,
-  и канал 0 есть в карте. Значит, всё соединение, видимо, идёт на одном канале данных 0 (2404 МГц).
-- Точность часов (SCA) разная: 7 в `sniff8`, 3 в `sniff10`.
+In follow mode the same request arrived with a bad CRC and other values (map `ff ff ff ff 1f`, hop 9–14),
+and the sniffer never followed the connection. The RD's signal at the dongle was weak, −69 to −80 dBm.
 
-В режиме слежения (`sniff3`, `sniff4`, `sniff9`) тот же запрос приходит с плохой CRC и с другими значениями:
-карта `ff ff ff ff 1f`, hop 9–14. За соединением сниффер не идёт ни разу, пакетов данных нет.
-Сигнал RD у свистка слабый, от −69 до −80 дБм.
+Conclusion (corrected in section 17: hop 0 was corruption, it's actually CSA #2): the stock nRF Sniffer can't
+follow this connection, so the dongle needs its own firmware.
 
-Вывод (исправлен в разделе 17: hop 0 оказался искажением, на деле CSA #2): стандартный nRF Sniffer за этим соединением не уследил. Нужна своя прошивка для свистка:
-поймать CONNECT_IND, взять из него access address и CRC init, сесть на 2404 МГц и писать всё подряд.
+## 17. The full RD↔pod conversation (2026-11-02, own dongle firmware)
 
-## 17. Полный разговор RD с настоящим шифтером (2026-11-02, своя прошивка свистка)
+Captured with the nRF52840 dongle running the firmware in `dongle/` (reader `mac/dongle_sniff.py`).
 
-Записано свистком nRF52840 со своей прошивкой (`dongle/`, приёмник `mac/dongle_sniff.py`), файлы `mac/sniff12.pcap/.txt`.
+**Section 16 is wrong.** The Nordic sniffer received CONNECT_IND with corrupted bits. The real parameters (good CRC):
 
-**Раздел 16 неверен.** Сниффер Nordic принимал CONNECT_IND с искажёнными битами. Настоящие параметры (CRC сошлась):
+- header `e5`: **ChSel = 1 (CSA #2)**, TxAdd and RxAdd random;
+- window 5, offset 0, interval 24 (30 ms), latency 0, timeout 400 (4 s);
+- all 37 channels, hop 11–15 (unused with CSA #2), SCA 0.
 
-- заголовок `e5`: **ChSel = 1 (CSA #2)**, TxAdd и RxAdd random;
-- окно 5, смещение 0, интервал 24 (30 мс), latency 0, таймаут 400 (4 с);
-- все 37 каналов, hop 11–15 (при CSA #2 не используется), SCA 0.
+The session (who sends is clear from the timing within each event):
 
-Ход соединения (кто шлёт, видно по времени внутри события):
-
-| событие | кто | что |
+| Event | Who | What |
 |---|---|---|
-| 0 | RD → под | ATT MTU_REQ 247 |
-| 0 | под → RD | ATT MTU_REQ 247 (под тоже начинает обмен MTU) |
-| 1–3 | оба | LL_LENGTH_REQ/RSP 251/2120, ATT MTU_RSP 247 |
-| 5–6 | RD → под, ответ | FIND_BY_TYPE_VALUE (поиск NUS) → сервис 0x000b–0xffff |
-| 7–12 | RD → под | READ_BY_TYPE 0x2803, FIND_INFO: 0x000d write, 0x000f notify, 0x0010 CCCD |
-| 13 | RD → под | WRITE_REQ 0x0010 = `01 00` (подписка) и сразу WRITE_CMD 0x000d = `03 01 00 00 01 01 03 20 00…` (20 байт) |
-| 13 | под → RD | WRITE_RSP |
-| 14 | под → RD | **NOTIFY 0x000f без данных (длина 0)** — ответ на 20 байт |
-| 68 (~1,7 с) | под → RD | L2CAP CONN_PARAM_UPDATE_REQ: 32–64 (40–80 мс), latency 4, таймаут 200 (2 с) |
-| 69–70 | RD → под | согласие, LL_CONNECTION_UPDATE_IND: интервал 64 (80 мс), latency 4, таймаут 200 |
-| дальше | под → RD | кнопки: `04 38 02 3e` / `04 38 0a 46` (вверх), `04 38 01 3d` / `04 38 09 45` (вниз) |
+| 0 | RD → pod | ATT MTU_REQ 247 |
+| 0 | pod → RD | ATT MTU_REQ 247 (the pod also starts an MTU exchange) |
+| 1–3 | both | LL_LENGTH_REQ/RSP 251/2120, ATT MTU_RSP 247 |
+| 5–6 | RD → pod, reply | FIND_BY_TYPE_VALUE (NUS lookup) → service 0x000b–0xffff |
+| 7–12 | RD → pod | READ_BY_TYPE 0x2803, FIND_INFO: 0x000d write, 0x000f notify, 0x0010 CCCD |
+| 13 | RD → pod | WRITE_REQ 0x0010 = `01 00` (subscribe), then WRITE_CMD 0x000d = `03 01 00 00 01 01 03 20 00…` (20 bytes) |
+| 13 | pod → RD | WRITE_RSP |
+| 14 | pod → RD | **NOTIFY 0x000f with no data (length 0)**, the reply to the 20 bytes |
+| 68 (~1.7 s) | pod → RD | L2CAP CONN_PARAM_UPDATE_REQ: 32–64 (40–80 ms), latency 4, timeout 200 (2 s) |
+| 69–70 | RD → pod | accepted, LL_CONNECTION_UPDATE_IND: interval 64 (80 ms), latency 4, timeout 200 |
+| later | pod → RD | buttons: `04 38 02 3e` / `04 38 0a 46` (up), `04 38 01 3d` / `04 38 09 45` (down) |
 
-Чего у настоящего пода **нет**: статус-кадров `04 38 10 4c` раз в секунду. За 10 с записи под слал только кадры кнопок.
-Плата их слала, и RD мог принимать их за команду. Это главный подозреваемый в потере сопряжения.
+What the real pod **doesn't** send: status frames `04 38 10 4c` once a second. In 10 s it sent only button frames.
+The board sent them, and the RD may have taken them as a command. Main suspect for the lost pairing.
 
-Байт 8 в 20 байтах RD меняется от сессии к сессии: `22` (плата, раздел 15), `20`, потом `1e` (настоящий под после проверки платы). Похоже на счётчик или уровень заряда, на сопряжение не влияет.
+Byte 8 of the RD's 20 bytes changes between sessions (`22`, `20`, `1e`). Looks like a counter or a charge level;
+it doesn't affect pairing.
 
-Что поменяно в плате: пустой notify на …0003 после 20 байт; запрос параметров 40–80 мс, latency 4, таймаут 2 с
-через 1,7 с после подключения; статус-кадры убраны.
+Board changes: an empty notify on …0003 after the 20 bytes; a parameter request (40–80 ms, latency 4, timeout 2 s)
+1.7 s after connecting; no status frames.
 
-**Проверено 2026-11-02, 22:30.** Плата с исправленной прошивкой: RD подключился, прислал 20 байт с `20` (как настоящему поду),
-получил пустой notify, переключил передачу по команде с платы. После этого плату отключили, батарейку в шифтер вставили:
-шифтер сразу переключает, сопряжение не слетело.
+**Verified 2026-11-02.** With the fixed firmware the RD connected, sent the 20 bytes with `20` (as to the real pod),
+got the empty notify and shifted on a command from the board. Then the board was switched off and the battery put
+back in the shifter: the shifter worked at once, pairing was intact.
 
-## 18. Два шифтера одновременно? (2026-11-02)
+## 18. Two shifters at once? (2026-11-02)
 
-Плате дали свой адрес `c0:00:00:00:00:02` (random), реклама та же, что у шифтера (с адресом RD в хвосте).
+The board was given its own random address, with the same advertisement as the shifter (RD address in the tail).
 
-- Шифтер и плата в эфире вместе: RD подключился только к шифтеру, к плате нет.
-- Батарейку из шифтера вынули, плата одна в эфире: RD к плате **не подключился**.
+- Shifter and board on air together: the RD connected only to the shifter.
+- Shifter's battery out, board alone: the RD **didn't connect** to the board.
 
-Вывод: RD подключается по запомненному адресу шифтера, а не по содержимому рекламы. Плате вернули адрес шифтера.
-Второй шифтер возможен только если RD умеет запоминать два адреса при сопряжении (неизвестно), или через плату-посредника.
+So outside pairing the RD connects by the remembered shifter address, not by advertisement content.
 
-Сопряжение по инструкции Wheeltop: на секунду включить питание переключателя, затем нажать любую кнопку на шифтере.
-Пробовали сопрячь оба (шифтер и плату): RD запоминает только тот, на котором нажали кнопку первым после включения
-сопряжения, второй после этого недоступен. **RD держит один шифтер.** Работать вместе они могут только через плату-посредника.
+Pairing by Wheeltop's instructions: power the derailleur for a second, then press any button on the shifter.
+Pairing both (shifter and board) in one go: the RD keeps only the one whose button was pressed first after
+pairing started; the other is then ignored. **The RD holds one shifter.**
 
-### Как идёт сопряжение (записи `mac/sniff14-pairing.*`, `mac/sniff15-pairing.*`, лог платы)
+### How pairing goes (captures and the board's log)
 
-- Реклама шифтера не меняется ни при нажатии кнопки, ни при сопряжении.
-- Реклама RD (`EDS OX2`, manufacturer data `ff ff ff e0 00 00 00 00 03 52 04 23 4f ac 22 00 YY`):
-  `YY` = `0f`, пока к нему подключён шифтер, и `00` без шифтера. Значение `9c` вместо `ac` было ошибкой приёма.
-- Подключение питания к RD включает сопряжение. RD подключился к **плате с новым адресом** `…:95` (TX Right),
-  хотя родной шифтер тоже был в эфире: обычный поиск, подписка, 20 байт `03 01 00 00 01 01 03 1e …`, пустой notify.
-  Кнопку на плате не нажимали; через ~8 с RD отписался и отключился (причина 0x208).
-- Значит, в режиме сопряжения RD подключается к шифтерам Wheeltop с любым адресом и ждёт нажатия кнопки.
-  Плату типа TX Left (`0x36`) в режиме сопряжения RD не трогал: похоже, этот RD левые шифтеры не принимает.
-- В режиме сопряжения RD может сначала (до поиска сервисов) писать в хэндл `0x0000`:
-  `03 00 00 00 01 01 03 1e …` и `03 01 00 00 01 01 03 1e …`.
+- The shifter's advertisement doesn't change on a button press or during pairing.
+- The RD's advertisement (`EDS OX2`, manufacturer data `ff ff <RD address> 52 04 23 4f ac 22 00 YY`):
+  `YY` = `0f` while a shifter is connected, `00` without one. A `9c` instead of `ac` was a reception error.
+- Powering the RD starts pairing. The RD connected to the **board with its new address** (TX Right),
+  although the native shifter was also on air: normal discovery, subscription, 20 bytes `03 01 00 00 01 01 03 1e …`,
+  empty notify. No button was pressed on the board; after ~8 s the RD unsubscribed and disconnected (reason 0x208).
+- So in pairing mode the RD connects to Wheeltop shifters with any address and waits for a button press.
+  A TX Left (`0x36`) board was ignored in pairing mode: this RD apparently doesn't take left shifters.
+- In pairing mode the RD may first (before service discovery) write to handle `0x0000`:
+  `03 00 00 00 01 01 03 1e …` and `03 01 00 00 01 01 03 1e …`.
 
-Проверено: плата с адресом `…:95` сопрягается так же, как шифтер (нажатие кнопки в окне `board-buttons`, пока RD
-подключён в режиме сопряжения). Работает либо плата, либо шифтер — тот, что сопряжён последним, батарейки вынимать
-не нужно. Нажатия на обоих в одном сеансе сопряжения второй шифтер не добавляют.
+Verified: the board with its own address pairs like a shifter (a button press while the RD is connected in
+pairing mode). Either the board or the shifter works, whichever was paired last; no batteries need removing.
 
-Остаётся путь «плата как телефон»: RD рекламируется как `EDS OX2` и при подключённом шифтере, а приложение Wheeltop
-переключает передачи напрямую. Протокол приложения можно записать свистком.
+The remaining path: "board as the phone". The RD advertises as `EDS OX2` even with a shifter connected,
+and the Wheeltop app shifts gears directly.
 
-## 19. Протокол приложения Wheeltop ↔ RD (2026-11-03, `mac/sniff16-app.*`)
+## 19. Wheeltop app ↔ RD protocol (2026-11-03)
 
-Телефон (central) подключается к RD (`EDS OX2`, peripheral) **одновременно** с шифтером. Шифрования нет.
-У RD тот же NUS: телефон пишет в `0x000d` (WRITE_CMD), RD отвечает notify с `0x000f`, CCCD `0x0010`.
-Телефон переводит связь на 2M PHY и меняет карту каналов, сниффер (своя прошивка) это выдерживает.
+The phone (central) connects to the RD (`EDS OX2`, peripheral) **at the same time** as the shifter. No encryption.
+The RD has the same NUS: the phone writes to `0x000d` (WRITE_CMD), the RD replies with notify on `0x000f`,
+CCCD `0x0010`. The phone switches the link to 2M PHY and updates the channel map; the dongle sniffer copes.
 
-Кадр телефона: `fe 32 <флаг> <команда> <длина> <данные> <CRC>`, где CRC — **CRC-16/MODBUS** по всему кадру
-(от `fe`), записанный старшим байтом вперёд. Флаг `00` у приветствия, потом `41`.
+Phone frame: `fe 32 <session> <command> <length> <data> <CRC>`, where CRC is **CRC-16/MODBUS** over the whole
+frame (from `fe`), sent high byte first. The session byte is `00` in the hello, then the RD's session (here `41`).
 
-| Кадр | Что |
+| Frame | What |
 |---|---|
-| `fe 32 00 11 08 79 4f 54 6d 4b 35 30 7a` | приветствие, данные — ASCII `yOTmK50z`; RD отвечает `fe 73 00 50 40 00 df 21` |
+| `fe 32 00 11 08 79 4f 54 6d 4b 35 30 7a` | hello, data is ASCII `yOTmK50z`; the RD replied `fe 73 00 50 40 00 df 21` |
 | `fe 32 41 fa 01 80` | ? |
-| `fe 32 41 fb 03 00 NN 51` | чтение страницы NN = 0…3; RD отвечает текстом (см. ниже) |
-| `fe 32 41 64 01 38` | ? (`0x38` — тип TX Right) |
+| `fe 32 41 fb 03 00 NN 51` | read page NN = 0…3; the RD replies with text (below) |
+| `fe 32 41 64 01 38` | ? (`0x38` is the TX Right type) |
 | `fe 32 41 97 00` | ? |
-| `fe 32 41 99 01 02` | **передача вверх** |
-| `fe 32 41 99 01 01` | **передача вниз** |
+| `fe 32 41 99 01 02` | **shift up** |
+| `fe 32 41 99 01 01` | **shift down** |
 
-Страницы `fb` — текст: `L_Ver/L_POWER/R_Ver/R_POWER/Q_Ver/Q_POWER/H_Ver:23.4,3/H_POWER:798/H_NAME:EDS OX2/
-TOTAL_CNT:12/NUM:10/…/KeySwitch/RacingMode/HRunCnt/RunTime/ErrList/ERRCODE/H_GEA[1..12]` (положения передач),
-`ANT_Ver:6.4`, `SYSFLAG`. `L_`/`R_` — видимо, левый и правый шифтер.
+The `fb` pages are text: `L_Ver/L_POWER/R_Ver/R_POWER/Q_Ver/Q_POWER/H_Ver:23.4,3/H_POWER:798/H_NAME:EDS OX2/
+TOTAL_CNT:12/NUM:10/…/KeySwitch/RacingMode/HRunCnt/RunTime/ErrList/ERRCODE/H_GEA[1..12]` (gear positions),
+`ANT_Ver:6.4`, `SYSFLAG`. `L_`/`R_` are probably the left and right shifters.
 
-**Перемешивание и сеанс (разобрано 2026-11-03).** Кадр любой стороны: `fe K <байты> <CRC>`. Байты между K и CRC
-XOR-ятся с ключом `(K − 0x32) mod 256`. Телефон шлёт K = `0x32`, поэтому его кадры открытые; RD выбирает K случайно.
-В открытом виде: `<сеанс> <команда> <длина> <данные>`.
+**Scrambling and the session.** A frame from either side is `fe K <bytes> <CRC>`. The bytes between K and the CRC
+are XORed with the key `(K − 0x32) mod 256`. The phone sends K = `0x32`, so its frames are plain; the RD picks K
+at random. Plain form: `<session> <command> <length> <data>`.
 
-- Приветствие телефона: сеанс `00`, команда `11`, данные `yOTmK50z`. Ответ RD: `<S> 11 01 <S>`, где S — номер сеанса
-  (случайный: у телефона был `41`, у Мака `d3`, `14`).
-- Все следующие команды телефона идут с этим S: `fe 32 S 99 01 02` — вверх. **С чужим S RD молча игнорирует команды.**
-- Ответ на переключение: `S 99 01 00`.
-- Отчёт RD о передаче (после каждого переключения, в том числе с шифтера, и раз в ~1 с): `S 98 06 4f 00 21 00 GG 00`,
-  GG — номер передачи (09, 0a, 0b…).
+- The phone's hello: session `00`, command `11`, data `yOTmK50z`. The RD replies `<S> 11 01 <S>`, S being the
+  session number (random each time).
+- Every later command uses this S: `fe 32 S 99 01 02` shifts up. **The RD silently ignores commands with another S.**
+- Shift reply: `S 99 01 00`.
+- Gear report from the RD (after every shift, including shifts from the shifter, and about once a second):
+  `S 98 06 4f 00 21 00 GG 00`, GG being the gear number (09, 0a, 0b…).
 
-**Проверено:** утилита `mac/rd-app` (Мак как приложение) переключает передачи, и родной шифтер при этом тоже работает.
+**Verified:** `mac/rd-app` (the Mac as the app) shifts gears, and the native shifter keeps working.
 
-**В плате (2026-11-03):** режим `mode app` прошивки `esp32/wheeltop_pod` делает то же самое: ищет RD по имени
-`EDS OX…` или адресу в рекламе, подключается, подписывается на `…0003`, шлёт приветствие и берёт сеанс из ответа,
-кнопки шлют `99 01 02/01`. Проверено с сопряжённым родным шифтером: работают оба. Приветствия и команд `99`
-достаточно, остальная инициализация приложения (`fa`, `fb`, `64`, `97`) не нужна.
+**On the board (2026-11-03):** `esp32/wheeltop_pod` in app mode does the same: it finds the RD by the name
+`EDS OX…` or its own address in the manufacturer data, connects, subscribes to `…0003`, sends the hello, takes the
+session from the reply, and the buttons send `99 01 02/01`. Verified with the native shifter paired: both work.
+The hello and the `99` commands are enough; the rest of the app's start-up (`fa`, `fb`, `64`, `97`) isn't needed.

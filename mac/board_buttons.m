@@ -1,9 +1,10 @@
-// Две кнопки шифтера на экране Мака: шлют кадры через плату ESP32 (команда raw) так же, как настоящий шифтер.
-// Нажатие — код press, через 540 мс удержания — код hold, отпускание — код release.
-// Клавиши ↑ и ↓ работают так же, их можно зажать обе сразу. Галочка «T» — режим fine-tune.
+// Two shifter buttons on the Mac screen that shift through the ESP32 board.
+// App mode: a press sends u/d, a held button repeats it every 0.3 s after 0.54 s, like the board's own buttons.
+// Pod mode: frames go through the raw command like the real shifter: press code, hold code after 540 ms, release code.
+// The ↑ and ↓ keys work the same way and can be held together. The "T" checkbox is fine-tune (pod mode only).
 //
 //   ./board-buttons [/dev/cu.usbmodemXXX]
-// Сборка: clang -O2 -fobjc-arc -framework Cocoa board_buttons.m -o board-buttons
+// Build: ./build.sh
 
 #import <Cocoa/Cocoa.h>
 #include <fcntl.h>
@@ -11,7 +12,8 @@
 #include <termios.h>
 #include <unistd.h>
 
-static const NSTimeInterval HOLD_AFTER = 0.54; // как у настоящего шифтера
+static const NSTimeInterval HOLD_AFTER = 0.54; // like the real shifter
+static const NSTimeInterval REPEAT_EVERY = 0.3; // app mode, like the board firmware
 
 static int openPort(const char *path) {
   int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -24,7 +26,7 @@ static int openPort(const char *path) {
   return fd;
 }
 
-// Ищет плату: шлёт info и ждёт строку «Тип пода»
+// Finds the board: sends info and waits for the "Mode:" line
 static NSString *findBoard(int *outFd, NSString **outInfo) {
   glob_t g;
   if (glob("/dev/cu.usbmodem*", 0, NULL, &g) != 0) return nil;
@@ -38,9 +40,9 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
       char buf[1024];
       ssize_t r = read(fd, buf, sizeof buf);
       if (r > 0) [got appendString:[[NSString alloc] initWithBytes:buf length:r encoding:NSUTF8StringEncoding] ?: @""];
-      if ([got containsString:@"Тип пода"]) break;
+      if ([got containsString:@"Mode:"]) break;
     }
-    if ([got containsString:@"Тип пода"]) {
+    if ([got containsString:@"Mode:"]) {
       NSString *p = @(g.gl_pathv[i]);
       globfree(&g);
       *outFd = fd;
@@ -55,7 +57,7 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
 
 @class AppDelegate;
 
-// Большая кнопка: события нажатия и отпускания мыши приходят отдельно, в отличие от NSButton
+// A big button: mouse down and mouse up arrive separately, unlike NSButton
 @interface PadView : NSView
 @property (copy) NSString *title;
 @property BOOL down;
@@ -81,7 +83,7 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
 }
 @end
 
-// Окно, которое ловит ↑ и ↓
+// A view that catches ↑ and ↓
 @interface KeyView : NSView
 @property (copy) void (^onKey)(BOOL up, BOOL down);
 @end
@@ -111,8 +113,9 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
   NSTextView *_log;
   int _fd;
   NSString *_port;
-  uint8_t _type;           // 0x38 TX Right и т. п.; 0x37 — OX (3-байтовые кадры)
-  NSTimer *_holdTimer[2];  // 0 — вниз, 1 — вверх
+  BOOL _appMode;
+  uint8_t _type;           // 0x38 TX Right etc.; 0x37 is OX (3-byte frames)
+  NSTimer *_holdTimer[2];  // 0 is down, 1 is up
   NSMutableString *_rx;
   dispatch_source_t _src;
   BOOL _rdConnected;
@@ -124,7 +127,7 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
     _fd = fd;
     _type = 0x38;
     _rx = [NSMutableString string];
-    [self parseLine:info];
+    for (NSString *l in [info componentsSeparatedByString:@"\n"]) [self parseLine:l];
   }
   return self;
 }
@@ -135,23 +138,24 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
                                                NSWindowStyleMaskMiniaturizable
                                        backing:NSBackingStoreBuffered
                                          defer:NO];
-  _win.title = @"Кнопки шифтера через плату";
+  _win.title = @"Shifter buttons via the board";
   KeyView *root = [[KeyView alloc] initWithFrame:_win.contentView.bounds];
   _win.contentView = root;
   __weak AppDelegate *weakSelf = self;
   root.onKey = ^(BOOL up, BOOL down) { [weakSelf button:up down:down]; };
 
   _up = [[PadView alloc] initWithFrame:NSMakeRect(20, 390, 420, 110)];
-  _up.title = @"▲  Вверх  (↑)";
+  _up.title = @"▲  Up  (↑)";
   _up.onChange = ^(BOOL d) { [weakSelf button:YES down:d]; };
   _down = [[PadView alloc] initWithFrame:NSMakeRect(20, 270, 420, 110)];
-  _down.title = @"▼  Вниз  (↓)";
+  _down.title = @"▼  Down  (↓)";
   _down.onChange = ^(BOOL d) { [weakSelf button:NO down:d]; };
   [root addSubview:_up];
   [root addSubview:_down];
 
-  _fine = [NSButton checkboxWithTitle:@"Положение T (fine-tune)" target:nil action:nil];
+  _fine = [NSButton checkboxWithTitle:@"T position (fine-tune, pod mode)" target:nil action:nil];
   _fine.frame = NSMakeRect(24, 236, 300, 24);
+  _fine.enabled = !_appMode;
   [root addSubview:_fine];
 
   _status = [NSTextField labelWithString:@""];
@@ -177,14 +181,15 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
   _src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, _fd, 0, dispatch_get_main_queue());
   dispatch_source_set_event_handler(_src, ^{ [weakSelf readPort]; });
   dispatch_resume(_src);
-  [self appendLog:[NSString stringWithFormat:@"Плата на %@", _port]];
+  [self appendLog:[NSString stringWithFormat:@"Board on %@", _port]];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)a { return YES; }
 
 - (void)updateStatus {
-  _status.stringValue = [NSString stringWithFormat:@"Плата: %@   Тип: 0x%02x   Переключатель: %@", _port.lastPathComponent,
-                                                   _type, _rdConnected ? @"подключён" : @"не подключён"];
+  NSString *mode = _appMode ? @"app" : [NSString stringWithFormat:@"pod 0x%02x", _type];
+  _status.stringValue = [NSString stringWithFormat:@"Board: %@   Mode: %@   Derailleur: %@", _port.lastPathComponent,
+                                                   mode, _rdConnected ? @"connected" : @"not connected"];
   _status.textColor = _rdConnected ? NSColor.systemGreenColor : NSColor.secondaryLabelColor;
 }
 
@@ -198,12 +203,16 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
 }
 
 - (void)parseLine:(NSString *)l {
-  NSRange r = [l rangeOfString:@"Тип пода: 0x"];
+  if ([l hasPrefix:@"Mode: app"]) _appMode = YES;
+  if ([l hasPrefix:@"Mode: pod"]) _appMode = NO;
+  NSRange r = [l rangeOfString:@"Pod type: 0x"];
   if (r.location != NSNotFound && l.length >= NSMaxRange(r) + 2)
     _type = (uint8_t)strtoul([[l substringWithRange:NSMakeRange(NSMaxRange(r), 2)] UTF8String], NULL, 16);
-  if ([l containsString:@"RD подключён: да"] || [l containsString:@"Подключился central"] || [l containsString:@"MTU "])
+  if ([l containsString:@"RD connected: yes"] || [l containsString:@"Central connected"] ||
+      [l containsString:@"MTU "] || [l containsString:@"ready to shift"])
     _rdConnected = YES;
-  if ([l containsString:@"RD подключён: нет"] || [l containsString:@"Отключился"]) _rdConnected = NO;
+  if ([l containsString:@"RD connected: no"] || [l hasPrefix:@"Disconnected"] || [l containsString:@"RD disconnected"])
+    _rdConnected = NO;
 }
 
 - (void)readPort {
@@ -211,7 +220,7 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
   ssize_t n = read(_fd, buf, sizeof buf);
   if (n <= 0) {
     if (n == 0) {
-      [self appendLog:@"Плата отключилась"];
+      [self appendLog:@"Board disconnected"];
       dispatch_source_cancel(_src);
     }
     return;
@@ -229,16 +238,18 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
   [self updateStatus];
 }
 
-- (void)sendCode:(uint8_t)code {
-  NSString *cmd;
-  if (_type == 0x37)
-    cmd = [NSString stringWithFormat:@"raw 04 %02x %02x\n", code, 0x04 ^ code];
-  else
-    cmd = [NSString stringWithFormat:@"raw 04 %02x %02x %02x\n", _type, code, (0x04 + _type + code) & 0xff];
+- (void)send:(NSString *)cmd {
   write(_fd, cmd.UTF8String, strlen(cmd.UTF8String));
 }
 
-// Коды как в прошивке платы: press 02/01 (fine 06/05), hold 04/03 (fine 08/07), release 0a/09
+- (void)sendCode:(uint8_t)code {
+  if (_type == 0x37)
+    [self send:[NSString stringWithFormat:@"raw 04 %02x %02x\n", code, 0x04 ^ code]];
+  else
+    [self send:[NSString stringWithFormat:@"raw 04 %02x %02x %02x\n", _type, code, (0x04 + _type + code) & 0xff]];
+}
+
+// Pod codes as in the board firmware: press 02/01 (fine 06/05), hold 04/03 (fine 08/07), release 0a/09
 - (void)button:(BOOL)up down:(BOOL)down {
   PadView *v = up ? _up : _down;
   if (v.down == down) return;
@@ -248,13 +259,20 @@ static NSString *findBoard(int *outFd, NSString **outInfo) {
   BOOL fine = _fine.state == NSControlStateValueOn;
   [_holdTimer[i] invalidate];
   _holdTimer[i] = nil;
+  __weak AppDelegate *weakSelf = self;
+  if (_appMode) {
+    if (!down) return;
+    NSString *cmd = up ? @"u\n" : @"d\n";
+    [self send:cmd];
+    _holdTimer[i] = [NSTimer timerWithTimeInterval:REPEAT_EVERY repeats:YES block:^(NSTimer *t) { [weakSelf send:cmd]; }];
+    _holdTimer[i].fireDate = [NSDate dateWithTimeIntervalSinceNow:HOLD_AFTER];
+    [[NSRunLoop mainRunLoop] addTimer:_holdTimer[i] forMode:NSRunLoopCommonModes];
+    return;
+  }
   if (down) {
     [self sendCode:up ? (fine ? 0x06 : 0x02) : (fine ? 0x05 : 0x01)];
     uint8_t hold = up ? (fine ? 0x08 : 0x04) : (fine ? 0x07 : 0x03);
-    __weak AppDelegate *weakSelf = self;
-    _holdTimer[i] = [NSTimer scheduledTimerWithTimeInterval:HOLD_AFTER repeats:NO block:^(NSTimer *t) {
-      [weakSelf sendCode:hold];
-    }];
+    _holdTimer[i] = [NSTimer timerWithTimeInterval:HOLD_AFTER repeats:NO block:^(NSTimer *t) { [weakSelf sendCode:hold]; }];
     [[NSRunLoop mainRunLoop] addTimer:_holdTimer[i] forMode:NSRunLoopCommonModes];
   } else {
     [self sendCode:up ? 0x0a : 0x09];
@@ -270,11 +288,11 @@ int main(int argc, const char **argv) {
     if (argc > 1) {
       port = @(argv[1]);
       fd = openPort(argv[1]);
-      if (fd < 0) { fprintf(stderr, "Не открыть %s\n", argv[1]); return 1; }
+      if (fd < 0) { fprintf(stderr, "Cannot open %s\n", argv[1]); return 1; }
       write(fd, "info\n", 5);
     } else {
       port = findBoard(&fd, &info);
-      if (!port) { fprintf(stderr, "Плата не найдена. Подключите её к Маку.\n"); return 1; }
+      if (!port) { fprintf(stderr, "Board not found. Connect it to the Mac.\n"); return 1; }
     }
     NSApplication *app = NSApplication.sharedApplication;
     app.activationPolicy = NSApplicationActivationPolicyRegular;

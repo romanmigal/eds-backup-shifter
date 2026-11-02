@@ -1,12 +1,12 @@
 #!/bin/sh
-# Собирает wheeltop-shifter. Info.plist вшивается в бинарник, чтобы macOS спросила доступ к Bluetooth.
+# Builds the Mac tools. Info.plist is embedded in the Bluetooth binaries so macOS asks for Bluetooth access.
 set -e
 cd "$(dirname "$0")"
 clang -O2 -fobjc-arc -framework Foundation -framework CoreBluetooth main.m -o wheeltop-shifter \
   -Wl,-sectcreate,__TEXT,__info_plist,Info.plist
-echo "Готово: $(pwd)/wheeltop-shifter"
+echo "Built: $(pwd)/wheeltop-shifter"
 clang -O2 -fobjc-arc -framework Cocoa board_buttons.m -o board-buttons
-echo "Готово: $(pwd)/board-buttons"
+echo "Built: $(pwd)/board-buttons"
 clang -O2 -fobjc-arc -framework Foundation -framework CoreBluetooth rd_app.m -o rd-app \
   -Wl,-sectcreate,__TEXT,__info_plist,Info.plist
-echo "Готово: $(pwd)/rd-app"
+echo "Built: $(pwd)/rd-app"

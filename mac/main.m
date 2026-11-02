@@ -1,6 +1,6 @@
-// wheeltop-shifter: Mac притворяется шифтером (подом) WHEELTOP EDS
-// и шлёт заднему переключателю (RD) кадры кнопок по BLE.
-// Протокол: ../wheeltop_eds_protocol_spec.md
+// wheeltop-shifter: the Mac pretends to be a WHEELTOP EDS shifter (pod)
+// and sends button frames to the rear derailleur (RD) over BLE.
+// Protocol: ../wheeltop_eds_protocol_spec.md
 
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <Foundation/Foundation.h>
@@ -9,12 +9,12 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#pragma mark - Протокол
+#pragma mark - Protocol
 
 static NSString *const kService = @"6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-// Как в стандартном NUS, проверено на настоящем TX Right 2026-10-23 (спецификация говорила наоборот).
-static NSString *const kRDWrite = @"6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write, write-nr: запись от RD
-static NSString *const kButtons = @"6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify: кнопки
+// As in standard NUS, checked on a real TX Right 2026-10-23 (the spec said the opposite).
+static NSString *const kRDWrite = @"6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write, write-nr: written by the RD
+static NSString *const kButtons = @"6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify: buttons
 
 enum {
     kDownPressed = 0x01, kUpPressed = 0x02,
@@ -23,7 +23,7 @@ enum {
     kStatus = 0x10,
 };
 
-// 0 означает OX (3-байтовые кадры), иначе байт типа TX-пода
+// 0 means OX (3-byte frames), otherwise the TX pod type byte
 static uint8_t podType = 0;
 
 static NSData *frame(uint8_t code) {
@@ -42,7 +42,7 @@ static NSString *hex(NSData *d) {
     return [parts componentsJoinedByString:@" "];
 }
 
-static FILE *logFile; // в режиме --listen лог дублируется в файл
+static FILE *logFile; // in --listen mode the log is also written to a file
 
 static void say(NSString *s) {
     static NSDateFormatter *f;
@@ -55,7 +55,7 @@ static void say(NSString *s) {
     }
 }
 
-#pragma mark - BLE-периферия
+#pragma mark - BLE peripheral
 
 @interface Pod : NSObject <CBPeripheralManagerDelegate>
 @property(nonatomic) CBPeripheralManager *pm;
@@ -82,11 +82,11 @@ static void say(NSString *s) {
     switch (p.state) {
     case CBManagerStatePoweredOn: [self setup]; break;
     case CBManagerStateUnauthorized:
-        say(@"Нет доступа к Bluetooth. Разреши его для Терминала: Системные настройки → Конфиденциальность → Bluetooth.");
+        say(@"No Bluetooth access. Allow it for Terminal: System Settings → Privacy & Security → Bluetooth.");
         break;
-    case CBManagerStatePoweredOff: say(@"Bluetooth выключен."); break;
-    case CBManagerStateUnsupported: say(@"Этот Мак не умеет быть BLE-периферией."); break;
-    default: say([NSString stringWithFormat:@"Состояние Bluetooth: %ld", (long)p.state]);
+    case CBManagerStatePoweredOff: say(@"Bluetooth is off."); break;
+    case CBManagerStateUnsupported: say(@"This Mac cannot act as a BLE peripheral."); break;
+    default: say([NSString stringWithFormat:@"Bluetooth state: %ld", (long)p.state]);
     }
 }
 
@@ -107,8 +107,8 @@ static void say(NSString *s) {
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)p didAddService:(CBService *)service error:(NSError *)error {
-    if (error) { say([NSString stringWithFormat:@"Ошибка добавления сервиса: %@", error]); return; }
-    // macOS разрешает рекламировать только имя и UUID сервисов, manufacturer data не уходит.
+    if (error) { say([NSString stringWithFormat:@"Adding the service failed: %@", error]); return; }
+    // macOS only lets us advertise a name and service UUIDs; manufacturer data is not sent.
     [p startAdvertising:@{
         CBAdvertisementDataLocalNameKey : self.name,
         CBAdvertisementDataServiceUUIDsKey : @[ [CBUUID UUIDWithString:kService] ],
@@ -116,18 +116,18 @@ static void say(NSString *s) {
 }
 
 - (void)peripheralManagerDidStartAdvertising:(CBPeripheralManager *)p error:(NSError *)error {
-    if (error) { say([NSString stringWithFormat:@"Реклама не запустилась: %@", error]); return; }
-    say([NSString stringWithFormat:@"Реклама идёт: имя \"%@\", %@. Жду подключения RD…", self.name,
-                                   podType ? [NSString stringWithFormat:@"TX, тип 0x%02x", podType] : @"OX"]);
+    if (error) { say([NSString stringWithFormat:@"Advertising did not start: %@", error]); return; }
+    say([NSString stringWithFormat:@"Advertising: name \"%@\", %@. Waiting for the RD to connect…", self.name,
+                                   podType ? [NSString stringWithFormat:@"TX, type 0x%02x", podType] : @"OX"]);
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)p central:(CBCentral *)central didSubscribeToCharacteristic:(CBCharacteristic *)c {
-    say([NSString stringWithFormat:@"Central %@ подписался на %@ (mtu %lu)", central.identifier.UUIDString, c.UUID,
+    say([NSString stringWithFormat:@"Central %@ subscribed to %@ (mtu %lu)", central.identifier.UUIDString, c.UUID,
                                    (unsigned long)central.maximumUpdateValueLength]);
     if (![c.UUID isEqual:[CBUUID UUIDWithString:kButtons]]) return;
     self.subscribers++;
     if (podType && !self.statusTimer) {
-        // TX-под шлёт статус-кадр раз в секунду, RD должен на него отвечать.
+        // A TX pod sends a status frame once a second; the RD is expected to answer it.
         __weak Pod *weakSelf = self;
         self.statusTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
             [weakSelf send:kStatus quiet:YES];
@@ -136,7 +136,7 @@ static void say(NSString *s) {
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)p central:(CBCentral *)central didUnsubscribeFromCharacteristic:(CBCharacteristic *)c {
-    say([NSString stringWithFormat:@"Central %@ отписался от %@", central.identifier.UUIDString, c.UUID]);
+    say([NSString stringWithFormat:@"Central %@ unsubscribed from %@", central.identifier.UUIDString, c.UUID]);
     if (![c.UUID isEqual:[CBUUID UUIDWithString:kButtons]]) return;
     self.subscribers = MAX(0, self.subscribers - 1);
     if (self.subscribers == 0) { [self.statusTimer invalidate]; self.statusTimer = nil; }
@@ -144,12 +144,12 @@ static void say(NSString *s) {
 
 - (void)peripheralManager:(CBPeripheralManager *)p didReceiveWriteRequests:(NSArray<CBATTRequest *> *)requests {
     for (CBATTRequest *r in requests)
-        say([NSString stringWithFormat:@"ЗАПИСЬ от RD → %@: %@", r.characteristic.UUID, hex(r.value ?: [NSData data])]);
+        say([NSString stringWithFormat:@"WRITE by RD → %@: %@", r.characteristic.UUID, hex(r.value ?: [NSData data])]);
     if (requests.firstObject) [p respondToRequest:requests.firstObject withResult:CBATTErrorSuccess];
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)p didReceiveReadRequest:(CBATTRequest *)r {
-    say([NSString stringWithFormat:@"ЧТЕНИЕ от RD ← %@", r.characteristic.UUID]);
+    say([NSString stringWithFormat:@"READ by RD ← %@", r.characteristic.UUID]);
     r.value = [NSData data];
     [p respondToRequest:r withResult:CBATTErrorSuccess];
 }
@@ -161,17 +161,17 @@ static void say(NSString *s) {
 
 - (void)send:(uint8_t)code quiet:(BOOL)quiet {
     NSData *d = frame(code);
-    if (!quiet) say([NSString stringWithFormat:@"→ %@%@", hex(d), self.subscribers ? @"" : @"  (RD не подключён, кадр в никуда)"]);
+    if (!quiet) say([NSString stringWithFormat:@"→ %@%@", hex(d), self.subscribers ? @"" : @"  (RD not connected, frame dropped)"]);
     if (!self.subscribers) return;
     if (self.pending.count || ![self.pm updateValue:d forCharacteristic:self.buttons onSubscribedCentrals:nil])
         [self.pending addObject:d];
 }
 
-// Одно нажатие: press, через 120 мс release (как короткий клик по кнопке пода).
+// One click: press, then release after 120 ms (like a short click on the pod's button).
 - (void)click:(BOOL)up {
     uint8_t press = up ? (self.fineTune ? kUpFinePressed : kUpPressed) : (self.fineTune ? kDownFinePressed : kDownPressed);
     uint8_t release = up ? kUpReleased : kDownReleased;
-    say([NSString stringWithFormat:@"Передача %@%@", up ? @"ВВЕРХ" : @"ВНИЗ", self.fineTune ? @" (fine-tune)" : @""]);
+    say([NSString stringWithFormat:@"Shift %@%@", up ? @"UP" : @"DOWN", self.fineTune ? @" (fine-tune)" : @""]);
     [self send:press quiet:NO];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [self send:release quiet:NO];
@@ -180,10 +180,10 @@ static void say(NSString *s) {
 
 @end
 
-#pragma mark - Подслушивание настоящего пода
+#pragma mark - Listening to a real pod
 
-// Мак подключается к поду как central (вместо RD) и записывает всё, что под шлёт.
-// Под принимает подключение, только пока RD его не занял, поэтому RD должен спать или быть выключен.
+// The Mac connects to the pod as a central (instead of the RD) and records everything the pod sends.
+// The pod only accepts a connection while the RD isn't connected, so the RD must be asleep or off.
 
 static const uint8_t kPrefix[] = {0x07, 0x0f, 0x00, 0x14, 0x55, 0x6a, 0x84};
 
@@ -193,39 +193,39 @@ static NSString *typeName(uint8_t t) {
     case 0x39: return @"TX Front";
     case 0x36: return @"TX Left";
     case 0x38: return @"TX Right";
-    default: return [NSString stringWithFormat:@"неизвестный 0x%02x", t];
+    default: return [NSString stringWithFormat:@"unknown 0x%02x", t];
     }
 }
 
 static NSString *codeName(uint8_t c) {
     switch (c) {
-    case 0x01: return @"нижняя нажата";
-    case 0x02: return @"верхняя нажата";
-    case 0x03: return @"нижняя удерживается";
-    case 0x04: return @"верхняя удерживается";
-    case 0x05: return @"нижняя нажата (fine-tune)";
-    case 0x06: return @"верхняя нажата (fine-tune)";
-    case 0x07: return @"нижняя удерживается (fine-tune)";
-    case 0x08: return @"верхняя удерживается (fine-tune)";
-    case 0x09: return @"нижняя отпущена";
-    case 0x0a: return @"верхняя отпущена";
-    case 0x10: return @"статус-кадр";
-    default: return @"НЕИЗВЕСТНЫЙ КОД";
+    case 0x01: return @"lower pressed";
+    case 0x02: return @"upper pressed";
+    case 0x03: return @"lower held";
+    case 0x04: return @"upper held";
+    case 0x05: return @"lower pressed (fine-tune)";
+    case 0x06: return @"upper pressed (fine-tune)";
+    case 0x07: return @"lower held (fine-tune)";
+    case 0x08: return @"upper held (fine-tune)";
+    case 0x09: return @"lower released";
+    case 0x0a: return @"upper released";
+    case 0x10: return @"status frame";
+    default: return @"UNKNOWN CODE";
     }
 }
 
 static NSString *decode(NSData *d) {
     const uint8_t *p = d.bytes;
     if (d.length == 3 && p[0] == 0x04)
-        return [NSString stringWithFormat:@"OX, код 0x%02x %@%@", p[1], codeName(p[1]),
-                                          p[2] == (0x04 ^ p[1]) ? @"" : @", КОНТРОЛЬНАЯ СУММА НЕ СОШЛАСЬ"];
+        return [NSString stringWithFormat:@"OX, code 0x%02x %@%@", p[1], codeName(p[1]),
+                                          p[2] == (0x04 ^ p[1]) ? @"" : @", CHECKSUM MISMATCH"];
     if (d.length == 4 && p[0] == 0x04)
-        return [NSString stringWithFormat:@"%@, код 0x%02x %@%@", typeName(p[1]), p[2], codeName(p[2]),
-                                          p[3] == ((0x04 + p[1] + p[2]) & 0xff) ? @"" : @", КОНТРОЛЬНАЯ СУММА НЕ СОШЛАСЬ"];
-    return @"формат не по спецификации";
+        return [NSString stringWithFormat:@"%@, code 0x%02x %@%@", typeName(p[1]), p[2], codeName(p[2]),
+                                          p[3] == ((0x04 + p[1] + p[2]) & 0xff) ? @"" : @", CHECKSUM MISMATCH"];
+    return @"format not as in the spec";
 }
 
-// Смещение префикса в manufacturer data или -1. У настоящего TX Right перед префиксом стоит company id ff ff.
+// Offset of the prefix in manufacturer data, or -1. A real TX Right has company id ff ff before the prefix.
 static NSInteger prefixOffset(NSData *mfr) {
     for (NSInteger off = 0; off <= 2; off += 2)
         if ((NSInteger)mfr.length >= off + (NSInteger)sizeof kPrefix && memcmp((const uint8_t *)mfr.bytes + off, kPrefix, sizeof kPrefix) == 0)
@@ -238,9 +238,9 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
 @interface Listener : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
 @property(nonatomic) CBCentralManager *cm;
 @property(nonatomic) CBPeripheral *pod;
-@property(nonatomic) NSMutableDictionary<NSUUID *, NSData *> *seen; // последняя реклама каждого пода
+@property(nonatomic) NSMutableDictionary<NSUUID *, NSData *> *seen; // last advertisement of each pod
 @property(nonatomic) NSDate *connectedAt;
-@property(nonatomic) BOOL all; // --scan: показывать все устройства и ни к чему не подключаться
+@property(nonatomic) BOOL all; // --scan: show all devices and connect to nothing
 @end
 
 @implementation Listener
@@ -254,7 +254,7 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
 }
 
 - (void)scan {
-    say(@"Ищу под WHEELTOP… Нажми любую кнопку на поде, чтобы он проснулся.");
+    say(@"Looking for a WHEELTOP pod… Press any button on the pod to wake it.");
     [self.cm scanForPeripheralsWithServices:nil options:@{CBCentralManagerScanOptionAllowDuplicatesKey : @YES}];
 }
 
@@ -262,10 +262,10 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
     switch (cm.state) {
     case CBManagerStatePoweredOn: [self scan]; break;
     case CBManagerStateUnauthorized:
-        say(@"Нет доступа к Bluetooth. Разреши его для Терминала: Системные настройки → Конфиденциальность → Bluetooth.");
+        say(@"No Bluetooth access. Allow it for Terminal: System Settings → Privacy & Security → Bluetooth.");
         break;
-    case CBManagerStatePoweredOff: say(@"Bluetooth выключен."); break;
-    default: say([NSString stringWithFormat:@"Состояние Bluetooth: %ld", (long)cm.state]);
+    case CBManagerStatePoweredOff: say(@"Bluetooth is off."); break;
+    default: say([NSString stringWithFormat:@"Bluetooth state: %ld", (long)cm.state]);
     }
 }
 
@@ -273,7 +273,7 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
      advertisementData:(NSDictionary *)ad RSSI:(NSNumber *)rssi {
     NSData *mfr = ad[CBAdvertisementDataManufacturerDataKey];
     if (self.all && !isWheeltop(mfr)) {
-        // Новое устройство или новая реклама; заметный скачок RSSI тоже печатаем, чтобы найти под по близости.
+        // New device or new advertisement; a noticeable RSSI jump is printed too, to find the pod by proximity.
         NSString *key = [NSString stringWithFormat:@"%@|%@|%@", hex(mfr ?: [NSData data]), ad[CBAdvertisementDataLocalNameKey] ?: @"",
                                                    [ad[CBAdvertisementDataServiceUUIDsKey] componentsJoinedByString:@","] ?: @""];
         NSData *keyData = [key dataUsingEncoding:NSUTF8StringEncoding];
@@ -282,7 +282,7 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
         NSMutableString *s = [NSMutableString stringWithFormat:@"%@ rssi %@", p.identifier.UUIDString, rssi];
         if (ad[CBAdvertisementDataLocalNameKey] || p.name) [s appendFormat:@"  \"%@\"", ad[CBAdvertisementDataLocalNameKey] ?: p.name];
         if (mfr) [s appendFormat:@"\r\n    mfr: %@", hex(mfr)];
-        if (ad[CBAdvertisementDataServiceUUIDsKey]) [s appendFormat:@"\r\n    сервисы: %@", [ad[CBAdvertisementDataServiceUUIDsKey] componentsJoinedByString:@", "]];
+        if (ad[CBAdvertisementDataServiceUUIDsKey]) [s appendFormat:@"\r\n    services: %@", [ad[CBAdvertisementDataServiceUUIDsKey] componentsJoinedByString:@", "]];
         if (ad[CBAdvertisementDataServiceDataKey]) [s appendFormat:@"\r\n    service data: %@", ad[CBAdvertisementDataServiceDataKey]];
         say(s);
         return;
@@ -292,42 +292,42 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
     self.seen[p.identifier] = mfr;
 
     NSInteger off = prefixOffset(mfr);
-    const uint8_t *m = (const uint8_t *)mfr.bytes + off; // m[0] это начало префикса 07 0f …
+    const uint8_t *m = (const uint8_t *)mfr.bytes + off; // m[0] is the start of the prefix 07 0f …
     NSInteger n = mfr.length - off;
-    NSMutableString *s = [NSMutableString stringWithFormat:@"РЕКЛАМА пода %@ rssi %@\r\n    mfr: %@\r\n    тип: %@",
+    NSMutableString *s = [NSMutableString stringWithFormat:@"POD ADVERTISEMENT %@ rssi %@\r\n    mfr: %@\r\n    type: %@",
                                                            p.identifier.UUIDString, rssi, hex(mfr), n > 7 ? typeName(m[7]) : @"?"];
     if (n > 11)
-        [s appendFormat:@", прошивка %d.%d, батарея %.2f В", m[8], m[9], ((m[10] << 8) | m[11]) / 100.0];
+        [s appendFormat:@", firmware %d.%d, battery %.2f V", m[8], m[9], ((m[10] << 8) | m[11]) / 100.0];
     if (n > 12)
-        [s appendFormat:@"\r\n    ещё %ld байт после батареи: %@", (long)(n - 12), hex([NSData dataWithBytes:m + 12 length:n - 12])];
-    if (ad[CBAdvertisementDataLocalNameKey]) [s appendFormat:@"\r\n    имя: %@", ad[CBAdvertisementDataLocalNameKey]];
-    if (ad[CBAdvertisementDataServiceUUIDsKey]) [s appendFormat:@"\r\n    сервисы: %@", [ad[CBAdvertisementDataServiceUUIDsKey] componentsJoinedByString:@", "]];
+        [s appendFormat:@"\r\n    %ld more bytes after the battery: %@", (long)(n - 12), hex([NSData dataWithBytes:m + 12 length:n - 12])];
+    if (ad[CBAdvertisementDataLocalNameKey]) [s appendFormat:@"\r\n    name: %@", ad[CBAdvertisementDataLocalNameKey]];
+    if (ad[CBAdvertisementDataServiceUUIDsKey]) [s appendFormat:@"\r\n    services: %@", [ad[CBAdvertisementDataServiceUUIDsKey] componentsJoinedByString:@", "]];
     if (ad[CBAdvertisementDataIsConnectable]) [s appendFormat:@"\r\n    connectable: %@", ad[CBAdvertisementDataIsConnectable]];
     say(s);
 
     if (!self.pod && !self.all) {
         self.pod = p;
         p.delegate = self;
-        say(@"Подключаюсь…");
+        say(@"Connecting…");
         [cm connectPeripheral:p options:nil];
     }
 }
 
 - (void)centralManager:(CBCentralManager *)cm didConnectPeripheral:(CBPeripheral *)p {
     self.connectedAt = [NSDate date];
-    say(@"Подключился. Читаю сервисы…");
+    say(@"Connected. Reading services…");
     [cm stopScan];
     [p discoverServices:nil];
 }
 
 - (void)centralManager:(CBCentralManager *)cm didFailToConnectPeripheral:(CBPeripheral *)p error:(NSError *)error {
-    say([NSString stringWithFormat:@"Не подключился: %@. Возможно, под занят переключателем, выключи RD.",
+    say([NSString stringWithFormat:@"Connection failed: %@. The pod may be busy with the RD; turn the RD off.",
                                    error.localizedDescription]);
     self.pod = nil;
 }
 
 - (void)centralManager:(CBCentralManager *)cm didDisconnectPeripheral:(CBPeripheral *)p error:(NSError *)error {
-    say([NSString stringWithFormat:@"Под отключился через %.1f с%@", -[self.connectedAt timeIntervalSinceNow],
+    say([NSString stringWithFormat:@"Pod disconnected after %.1f s%@", -[self.connectedAt timeIntervalSinceNow],
                                    error ? [@": " stringByAppendingString:error.localizedDescription] : @""]);
     self.pod = nil;
     [self.seen removeAllObjects];
@@ -336,7 +336,7 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
 
 - (void)peripheral:(CBPeripheral *)p didDiscoverServices:(NSError *)error {
     for (CBService *s in p.services) {
-        say([NSString stringWithFormat:@"Сервис %@", s.UUID.UUIDString]);
+        say([NSString stringWithFormat:@"Service %@", s.UUID.UUIDString]);
         [p discoverCharacteristics:nil forService:s];
     }
 }
@@ -350,33 +350,33 @@ static BOOL isWheeltop(NSData *mfr) { return prefixOffset(mfr) >= 0; }
         if (pr & CBCharacteristicPropertyWriteWithoutResponse) [props addObject:@"write-nr"];
         if (pr & CBCharacteristicPropertyNotify) [props addObject:@"notify"];
         if (pr & CBCharacteristicPropertyIndicate) [props addObject:@"indicate"];
-        say([NSString stringWithFormat:@"  характеристика %@ [%@]", c.UUID.UUIDString, [props componentsJoinedByString:@" "]]);
+        say([NSString stringWithFormat:@"  characteristic %@ [%@]", c.UUID.UUIDString, [props componentsJoinedByString:@" "]]);
         if (pr & CBCharacteristicPropertyRead) [p readValueForCharacteristic:c];
-        // Как BikeControl: подписываемся на всё, потому что неизвестно, где под шлёт данные.
+        // Like BikeControl: subscribe to everything, since we don't know where the pod sends data.
         if (pr & (CBCharacteristicPropertyNotify | CBCharacteristicPropertyIndicate)) [p setNotifyValue:YES forCharacteristic:c];
     }
 }
 
 - (void)peripheral:(CBPeripheral *)p didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)c error:(NSError *)error {
-    say([NSString stringWithFormat:@"  подписка на %@: %@", c.UUID.UUIDString, error ? error.localizedDescription : @"ок"]);
+    say([NSString stringWithFormat:@"  subscription to %@: %@", c.UUID.UUIDString, error ? error.localizedDescription : @"ok"]);
     if (!error && [c.UUID isEqual:[CBUUID UUIDWithString:kButtons]])
-        say(@"ГОТОВО. Нажимай кнопки на поде: коротко, долго, в положении R и в положении T.");
+        say(@"READY. Press the pod buttons: short, long, in position R and in position T.");
 }
 
 - (void)peripheral:(CBPeripheral *)p didUpdateValueForCharacteristic:(CBCharacteristic *)c error:(NSError *)error {
     NSData *v = c.value ?: [NSData data];
     if (!c.isNotifying) {
         NSString *text = [[NSString alloc] initWithData:v encoding:NSUTF8StringEncoding];
-        say([NSString stringWithFormat:@"  ЧТЕНИЕ %@: %@%@", c.UUID.UUIDString, hex(v),
+        say([NSString stringWithFormat:@"  READ %@: %@%@", c.UUID.UUIDString, hex(v),
                                        text.length ? [NSString stringWithFormat:@"  \"%@\"", text] : @""]);
         return;
     }
-    say([NSString stringWithFormat:@"КАДР %@ ← %@   (%@)", c.UUID.UUIDString, hex(v), decode(v)]);
+    say([NSString stringWithFormat:@"FRAME %@ ← %@   (%@)", c.UUID.UUIDString, hex(v), decode(v)]);
 }
 
 @end
 
-#pragma mark - Клавиатура
+#pragma mark - Keyboard
 
 static struct termios original;
 static void restoreTerminal(void) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &original); }
@@ -388,16 +388,16 @@ static void rawMode(void) {
     atexit(restoreTerminal);
 }
 
-#pragma mark - ESP32 по USB
+#pragma mark - ESP32 over USB
 
-// В этом режиме Мак только передаёт команды плате esp32/wheeltop_pod, а BLE делает она.
+// In this mode the Mac only passes commands to the esp32/wheeltop_pod board, which does the BLE.
 static int serialFd = -1;
 
 static NSString *findPort(void) {
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/dev" error:nil];
     for (NSString *f in [files sortedArrayUsingSelector:@selector(compare:)]) {
         if ([f hasPrefix:@"cu.usbserial"] || [f hasPrefix:@"cu.wchusbserial"] || [f hasPrefix:@"cu.SLAB_USBtoUART"] ||
-            ([f hasPrefix:@"cu.usbmodem"] && ![f containsString:@"NTBKFX"])) // usbmodem…NTBKFX у этого Мака это монитор LG
+            ([f hasPrefix:@"cu.usbmodem"] && ![f containsString:@"NTBKFX"])) // usbmodem…NTBKFX is a monitor's USB hub, not a board
             return [@"/dev/" stringByAppendingString:f];
     }
     return nil;
@@ -411,13 +411,13 @@ static BOOL openSerial(NSString *port) {
     cfmakeraw(&t);
     cfsetspeed(&t, B115200);
     t.c_cflag |= CLOCAL | CREAD;
-    t.c_cflag &= ~(CRTSCTS | HUPCL); // без аппаратного контроля потока запись в USB CDC зависает
+    t.c_cflag &= ~(CRTSCTS | HUPCL); // without hardware flow control, writes to USB CDC hang
     tcsetattr(serialFd, TCSANOW, &t);
-    // На ESP32-C3 с USB-Serial/JTAG поднятый RTS держит чип в сбросе, а macOS поднимает DTR и RTS при открытии.
+    // On an ESP32-C3 with USB-Serial/JTAG a raised RTS holds the chip in reset, and macOS raises DTR and RTS on open.
     int lines = TIOCM_DTR | TIOCM_RTS;
     ioctl(serialFd, TIOCMBIC, &lines);
 
-    // static: иначе ARC освободит источник при выходе из функции, и чтение молча прекратится.
+    // static: otherwise ARC frees the source when the function returns and reading silently stops.
     static dispatch_source_t src;
     src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, serialFd, 0, dispatch_get_main_queue());
     __block NSMutableData *line = [NSMutableData data];
@@ -433,7 +433,7 @@ static BOOL openSerial(NSString *port) {
                 [line appendBytes:&buf[i] length:1];
             }
         }
-        if (n == 0) { say(@"Плата отключилась."); exit(1); }
+        if (n == 0) { say(@"The board disconnected."); exit(1); }
     });
     dispatch_resume(src);
     return YES;
@@ -447,10 +447,10 @@ static void serialSend(NSString *cmd) {
 #pragma mark - main
 
 static void usage(void) {
-    printf("Использование: wheeltop-shifter [--type ox|tx-front|tx-left|tx-right] [--name ИМЯ]\n"
-           "               wheeltop-shifter --esp32 [ПОРТ]   (управлять платой ESP32 по USB)\n"
-           "               wheeltop-shifter --listen         (подключиться к настоящему поду и записать его кадры)\n"
-           "               wheeltop-shifter --scan           (показать все BLE-устройства рядом)\n");
+    printf("Usage: wheeltop-shifter [--type ox|tx-front|tx-left|tx-right] [--name NAME]\n"
+           "       wheeltop-shifter --esp32 [PORT]   (control the ESP32 board over USB)\n"
+           "       wheeltop-shifter --listen         (connect to a real pod and record its frames)\n"
+           "       wheeltop-shifter --scan           (show all BLE devices nearby)\n");
 }
 
 int main(int argc, const char *argv[]) {
@@ -471,7 +471,7 @@ int main(int argc, const char *argv[]) {
             } else if (!strcmp(argv[i], "--listen") || !strcmp(argv[i], "--scan")) {
                 BOOL all = !strcmp(argv[i], "--scan");
                 logFile = fopen(all ? "scan.log" : "capture.log", "a");
-                printf("%s Лог пишется в %s/%s. Выход: q\n", all ? "Скан всех BLE-устройств." : "Режим подслушивания.",
+                printf("%s Logging to %s/%s. Quit: q\n", all ? "Scanning all BLE devices." : "Listening mode.",
                        [NSFileManager defaultManager].currentDirectoryPath.UTF8String, all ? "scan.log" : "capture.log");
                 Listener *listener = [Listener new];
                 listener.all = all;
@@ -496,9 +496,9 @@ int main(int argc, const char *argv[]) {
         void (^up)(void), (^down)(void), (^fine)(void);
         if (esp32) {
             port = port ?: findPort();
-            if (!port) { printf("Плата ESP32 не найдена в /dev/cu.*. Подключи её или укажи порт: --esp32 /dev/cu.…\n"); return 1; }
-            if (!openSerial(port)) { printf("Не открыть %s: %s\n", port.UTF8String, strerror(errno)); return 1; }
-            printf("Плата: %s\n", port.UTF8String);
+            if (!port) { printf("No ESP32 board found in /dev/cu.*. Connect it or give the port: --esp32 /dev/cu.…\n"); return 1; }
+            if (!openSerial(port)) { printf("Cannot open %s: %s\n", port.UTF8String, strerror(errno)); return 1; }
+            printf("Board: %s\n", port.UTF8String);
             fflush(stdout);
             up = ^{ serialSend(@"u"); };
             down = ^{ serialSend(@"d"); };
@@ -509,25 +509,25 @@ int main(int argc, const char *argv[]) {
             down = ^{ [pod click:NO]; };
             fine = ^{
                 pod.fineTune = !pod.fineTune;
-                say(pod.fineTune ? @"Fine-tune: вкл (T)" : @"Fine-tune: выкл (R)");
+                say(pod.fineTune ? @"Fine-tune: on (T)" : @"Fine-tune: off (R)");
             };
         }
-        printf("WHEELTOP shifter для Mac\n"
-               "  ↑ / k / +   передача вверх (верхняя кнопка)\n"
-               "  ↓ / j / -   передача вниз (нижняя кнопка)\n"
-               "  t           режим fine-tune вкл/выкл (ползунок R/T)\n");
+        printf("WHEELTOP shifter for Mac\n"
+               "  ↑ / k / +   shift up (upper button)\n"
+               "  ↓ / j / -   shift down (lower button)\n"
+               "  t           fine-tune on/off (the R/T slider)\n");
         if (esp32)
-            printf("  s / a       скан: поды WHEELTOP / все устройства\n"
-                   "  i           настройки платы\n"
-                   "  :           ввести команду платы (clone 1, type tx-right, mac …, raw …, reset)\n");
-        printf("  q           выход\n");
+            printf("  s / a       scan: WHEELTOP pods / all devices\n"
+                   "  i           board settings\n"
+                   "  :           type a board command (pair, mode app, clone 1, type tx-right, mac …, raw …, reset)\n");
+        printf("  q           quit\n");
         rawMode();
         if (esp32) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ serialSend(@"info"); });
 
         dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, STDIN_FILENO, 0, dispatch_get_main_queue());
         static uint8_t esc[3];
         __block int escLen = 0;
-        __block NSMutableString *command = nil; // не nil, пока вводится команда после ':'
+        __block NSMutableString *command = nil; // not nil while a command after ':' is being typed
         dispatch_source_set_event_handler(src, ^{
             uint8_t buf[16];
             ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
@@ -541,7 +541,7 @@ int main(int argc, const char *argv[]) {
                     } else if (b == 0x7f) {
                         if (command.length) { [command deleteCharactersInRange:NSMakeRange(command.length - 1, 1)]; printf("\b \b"); }
                     } else if (b == 0x1b) {
-                        printf(" (отмена)\r\n");
+                        printf(" (cancelled)\r\n");
                         command = nil;
                     } else {
                         [command appendFormat:@"%c", b];
@@ -550,7 +550,7 @@ int main(int argc, const char *argv[]) {
                     fflush(stdout);
                     continue;
                 }
-                // Стрелки приходят как ESC [ A / ESC [ B
+                // Arrows arrive as ESC [ A / ESC [ B
                 if (escLen || b == 0x1b) {
                     esc[escLen++] = b;
                     if (escLen == 3) {

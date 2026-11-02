@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Читает свисток с прошивкой dongle/sniffer, печатает ATT и пишет .pcap для Wireshark.
+"""Reads the dongle running dongle/sniffer, prints ATT traffic and writes a .pcap for Wireshark.
 
-    python3 dongle_sniff.py [ПОРТ] [ФАЙЛ.pcap] [ЦЕЛЬ]
+    python3 dongle_sniff.py TARGET [FILE.pcap] [PORT]
 
-ЦЕЛЬ — адрес устройства, за чьими соединениями следить (по умолчанию шифтер c0:00:00:00:00:01).
-Для переключателя: e0:00:00:00:00:03, тогда central — телефон, peripheral — переключатель.
+TARGET is the address of the peripheral whose connections to follow, e.g. the shifter (pod) to watch
+the derailleur talking to it, or the derailleur to watch the phone app. The `s` command of the board
+firmware, or any BLE scanner app, shows the addresses.
 
-Без порта берёт первый /dev/cu.usbmodem*, который отвечает строкой "# alive".
-Ctrl+C — остановить. Рядом с .pcap пишется .txt со всеми строками свистка.
+Without PORT it takes the first /dev/cu.usbmodem* that answers with "# alive".
+Ctrl+C stops. A .txt with all the dongle's lines is written next to the .pcap.
 """
 import glob, os, select, struct, sys, termios, time, tty
 
@@ -22,7 +23,7 @@ LL_OPS = {0x00: "CONNECTION_UPDATE", 0x01: "CHANNEL_MAP", 0x02: "TERMINATE", 0x0
           0x16: "PHY_REQ", 0x17: "PHY_RSP", 0x18: "PHY_UPDATE_IND", 0x07: "UNKNOWN_RSP", 0x0f: "CONN_PARAM_REQ"}
 
 
-def rf_index(ch):  # номер RF-канала 0..39 (2402 МГц = 0) для заголовка pcap
+def rf_index(ch):  # RF channel number 0..39 (2402 MHz = 0) for the pcap header
     if ch == 37: return 0
     if ch == 38: return 12
     if ch == 39: return 39
@@ -50,7 +51,7 @@ def lines(fd):
         except BlockingIOError:
             continue
         if not chunk:
-            raise SystemExit("Свисток отключился")
+            raise SystemExit("The dongle disconnected")
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
@@ -70,7 +71,7 @@ def find_port():
             if time.time() > deadline:
                 break
         os.close(fd)
-    raise SystemExit("Не нашёл свисток с прошивкой сниффера")
+    raise SystemExit("No dongle with the sniffer firmware found")
 
 
 def describe(aa, pdu, role):
@@ -87,7 +88,7 @@ def describe(aa, pdu, role):
         return None
     llid = hdr & 3
     if ln == 0:
-        return None  # пустые пакеты
+        return None  # empty packets
     if llid == 3:
         return "%s LL %s %s" % (role, LL_OPS.get(pl[0], "0x%02x" % pl[0]), pl[1:].hex(" "))
     if llid == 2 and len(pl) >= 5:
@@ -101,21 +102,22 @@ def describe(aa, pdu, role):
                 return "%s %s handle 0x%04x: %s" % (role, name, h, a[3:].hex(" "))
             return "%s %s %s" % (role, name, a[1:].hex(" "))
         return "%s L2CAP cid 0x%04x %s" % (role, cid, a.hex(" "))
-    return "%s LL data (продолжение) %s" % (role, pl.hex(" "))
+    return "%s LL data (continuation) %s" % (role, pl.hex(" "))
 
 
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else None
+    if len(sys.argv) < 2 or len(sys.argv[1].replace(":", "")) != 12:
+        raise SystemExit(__doc__)
+    target = sys.argv[1].lower()
     out = sys.argv[2] if len(sys.argv) > 2 else time.strftime("dongle-%Y%m%d-%H%M%S.pcap")
-    target = sys.argv[3].lower() if len(sys.argv) > 3 else None
-    central, periph = ("RD ->", "   <- POD") if not target or target.startswith("c6:d5") else ("PHONE ->", "   <- RD")
+    port = sys.argv[3] if len(sys.argv) > 3 else None
+    central, periph = "CENTRAL ->", "   <- PERIPHERAL"
     if port:
         fd = open_port(port)
     else:
         port, fd = find_port()
-    print("Свисток на", port, "| пишу", out)
-    if target:
-        os.write(fd, ("t " + target.replace(":", "") + "\n").encode())
+    print("Dongle on", port, "| writing", out)
+    os.write(fd, ("t " + target.replace(":", "") + "\n").encode())
 
     pcap = open(out, "wb")
     pcap.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 256))  # DLT_BLUETOOTH_LE_LL_WITH_PHDR
@@ -151,7 +153,7 @@ def main():
             pcap.write(struct.pack("<IIII", int(ts), int((ts % 1) * 1e6), len(body), len(body)) + body)
             pcap.flush()
 
-            # Первый пакет события шлёт переключатель (central), следующий — шифтер, и так по очереди
+            # The central sends the first packet of each event, the peripheral the next, and so on
             if aa != ADV_AA:
                 key = (aa, event)
                 n = event_seen.get(key, 0)
@@ -169,7 +171,7 @@ def main():
     finally:
         pcap.close()
         txt.close()
-        print("\nСохранено:", out)
+        print("\nSaved:", out)
 
 
 if __name__ == "__main__":

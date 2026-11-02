@@ -1,13 +1,12 @@
-// Сниффер одного BLE-соединения для nRF52840 Dongle.
+// Sniffer for one BLE connection on the nRF52840 Dongle.
 //
-// Ждёт рекламу шифтера на рекламных каналах 37/38/39 и идёт за ним по каналам, как nRF Sniffer.
-// Когда переключатель шлёт шифтеру CONNECT_IND, берёт оттуда access address, CRC init,
-// интервал, карту каналов и hop и дальше сам прыгает по каналам данных (CSA #1).
-// Hop = 0 (так делает переключатель Wheeltop) тоже работает: тогда канал всегда один.
+// Waits for the target's advertisements on channels 37/38/39 and follows it across them, like nRF Sniffer.
+// When a central sends the target a CONNECT_IND, it takes the access address, CRC init, interval,
+// channel map and hop from it and then hops over the data channels itself (CSA #1 or CSA #2).
 //
-// Каждый принятый пакет уходит на Мак строкой через USB-порт:
-//   P <время мкс> <канал> <rssi> <crc 1/0> <access address> <номер события> <заголовок+payload hex>
-// Служебные строки начинаются с "#".
+// Every received packet goes to the Mac as a line over the USB port:
+//   P <time us> <channel> <rssi> <crc 1/0> <access address> <event counter> <header+payload hex>
+// Service lines start with "#".
 
 #include <stdio.h>
 #include <string.h>
@@ -16,17 +15,17 @@
 #include "tusb.h"
 #include "nrf.h"
 
-// За кем следим, в порядке байтов в эфире. По умолчанию шифтер c0:00:00:00:00:01.
-// Команда с Мака "t e00000000003" (адрес как пишут обычно) меняет цель, например на переключатель.
-static uint8_t TARGET[6] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0 };
+// Whom to follow, in over-the-air byte order. No target until the Mac sends "t aabbccddeeff"
+// (the address as usually written).
+static uint8_t TARGET[6];
 
 #define ADV_AA        0x8E89BED6u
 #define ADV_CRCINIT   0x555555u
-// От начала пакета до события ADDRESS: 40 мкс на 1M PHY, 24 мкс на 2M
+// From the start of the packet to the ADDRESS event: 40 us on 1M PHY, 24 us on 2M
 static uint32_t preamble_aa_us = 40;
 
 //--------------------------------------------------------------------+
-// Кольцевой буфер пакетов: пишет прерывание радио, читает main
+// Packet ring buffer: the radio interrupt writes, main reads
 //--------------------------------------------------------------------+
 typedef struct {
   uint32_t t;
@@ -35,7 +34,7 @@ typedef struct {
   uint8_t  ch;
   uint8_t  rssi;
   uint8_t  crcok;
-  uint16_t len;       // заголовок (2) + payload, до 257
+  uint16_t len;       // header (2) + payload, up to 257
   uint8_t  data[258];
 } pkt_t;
 
@@ -46,7 +45,7 @@ static volatile uint32_t ring_head, ring_tail, ring_drops;
 static uint8_t rxbuf[258] __attribute__((aligned(4)));
 
 //--------------------------------------------------------------------+
-// Состояние
+// State
 //--------------------------------------------------------------------+
 enum { ST_SCAN, ST_CONN };
 static volatile int state = ST_SCAN;
@@ -54,27 +53,27 @@ static volatile int state = ST_SCAN;
 static uint8_t  cur_ch;
 static uint32_t cur_aa;
 
-// Скан
+// Scan
 static uint8_t  scan_ch = 37;
 static uint32_t scan_armed_at;
 static volatile bool scan_hop_armed;
 
-// Соединение
+// Connection
 static struct {
   uint32_t aa, crcinit;
   uint32_t interval_us;
   uint32_t timeout_us;
   uint8_t  hop;
-  bool     csa2;            // ChSel = 1 в CONNECT_IND: каналы по CSA #2 (так делает переключатель)
-  uint16_t chan_id;         // для CSA #2: старшая половина AA xor младшая
+  bool     csa2;            // ChSel = 1 in CONNECT_IND: channels by CSA #2 (the Wheeltop RD does this)
+  uint16_t chan_id;         // for CSA #2: upper half of the AA xor lower half
   uint8_t  used[37];
   uint8_t  nused;
   uint8_t  last_unmapped;
   uint16_t event;
-  uint32_t anchor;          // ожидаемое (или пойманное) начало текущего события
-  uint32_t last_sync;       // начало последнего пойманного события
+  uint32_t anchor;          // expected (or caught) start of the current event
+  uint32_t last_sync;       // start of the last caught event
   bool     first_in_event;
-  // отложенные изменения по instant
+  // changes pending until their instant
   bool     chm_pending;  uint16_t chm_instant;  uint8_t chm_new[5];
   bool     upd_pending;  uint16_t upd_instant;  uint32_t upd_interval_us, upd_offset_us, upd_timeout_us;
   bool     phy_pending;  uint16_t phy_instant;  bool phy_2m;
@@ -84,8 +83,8 @@ static volatile bool note_conn, note_scan;
 static volatile uint32_t note_info[8];
 
 //--------------------------------------------------------------------+
-// Таймер: TIMER0 1 МГц. PPI 26/27 (заданы аппаратно) пишут время ADDRESS в CC[1], END в CC[2].
-// CC[0] — наше расписание, CC[3] — "сейчас".
+// Timer: TIMER0 at 1 MHz. PPI 26/27 (fixed in hardware) store the ADDRESS time in CC[1], END in CC[2].
+// CC[0] is our schedule, CC[3] is "now".
 //--------------------------------------------------------------------+
 static inline uint32_t now_us(void) {
   NRF_TIMER0->TASKS_CAPTURE[3] = 1;
@@ -106,9 +105,9 @@ static void unschedule(void) {
 }
 
 //--------------------------------------------------------------------+
-// Радио
+// Radio
 //--------------------------------------------------------------------+
-static uint32_t ch_freq(uint8_t ch) {   // МГц минус 2400
+static uint32_t ch_freq(uint8_t ch) {   // MHz minus 2400
   if (ch == 37) return 2;
   if (ch == 38) return 26;
   if (ch == 39) return 80;
@@ -169,13 +168,13 @@ static void radio_init(void) {
   NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
 
   NVIC_SetPriority(RADIO_IRQn, 0);
-  NVIC_SetPriority(TIMER0_IRQn, 0);   // тот же приоритет: обработчики не прерывают друг друга
+  NVIC_SetPriority(TIMER0_IRQn, 0);   // same priority: the handlers don't preempt each other
   NVIC_EnableIRQ(RADIO_IRQn);
   NVIC_EnableIRQ(TIMER0_IRQn);
 }
 
 //--------------------------------------------------------------------+
-// Скан и вход в соединение
+// Scanning and entering a connection
 //--------------------------------------------------------------------+
 static void start_scan(void) {
   unschedule();
@@ -187,7 +186,7 @@ static void start_scan(void) {
   note_scan = true;
 }
 
-static uint16_t csa2_perm(uint16_t v) {   // разворот битов в каждом байте
+static uint16_t csa2_perm(uint16_t v) {   // reverse the bits of each byte
   v = (uint16_t) (((v & 0xF0F0) >> 4) | ((v & 0x0F0F) << 4));
   v = (uint16_t) (((v & 0xCCCC) >> 2) | ((v & 0x3333) << 2));
   v = (uint16_t) (((v & 0xAAAA) >> 1) | ((v & 0x5555) << 1));
@@ -221,8 +220,8 @@ static void set_chm(const uint8_t *chm) {
 }
 
 static uint32_t margin_us(void) {
-  // Запас: 1 мс (на случай, если синхронизировались по ответу шифтера, а не по пакету RD)
-  // плюс 1000 ppm от времени без синхронизации
+  // Margin: 1 ms (in case we synced on the peripheral's reply rather than the central's packet)
+  // plus 1000 ppm of the time since the last sync
   return 1000 + (conn.anchor - conn.last_sync) / 1000;
 }
 
@@ -252,7 +251,7 @@ static void enter_conn(uint8_t hdr, const uint8_t *p, uint32_t t_end) {
 
   state = ST_CONN;
   radio_tune(next_data_channel(), conn.aa, conn.crcinit);
-  // Следующее событие: после конца окна передачи + интервал
+  // Next event: after the end of the transmit window plus the interval
   schedule(conn.anchor + win_size * 1250u + conn.interval_us - margin_us());
 
   note_info[0] = conn.aa; note_info[1] = conn.crcinit; note_info[2] = interval;
@@ -290,7 +289,7 @@ static void conn_next_event(void) {
   schedule(conn.anchor + conn.interval_us - margin_us());
 }
 
-// Управляющие PDU, которые меняют расписание
+// Control PDUs that change the schedule
 static void conn_ll_control(const uint8_t *pdu) {
   if ((pdu[0] & 0x03) != 0x03 || pdu[1] < 1) return;
   const uint8_t *c = pdu + 2;
@@ -309,19 +308,19 @@ static void conn_ll_control(const uint8_t *pdu) {
       conn.chm_instant = c[6] | (c[7] << 8);
       conn.chm_pending = true;
       break;
-    case 0x18:   // LL_PHY_UPDATE_IND: PHY M->S, PHY S->M, instant. Coded PHY не поддерживаем.
+    case 0x18:   // LL_PHY_UPDATE_IND: PHY M->S, PHY S->M, instant. Coded PHY is not supported.
       if (pdu[1] < 5 || (c[1] == 0 && c[2] == 0)) return;
       conn.phy_2m = ((c[1] | c[2]) & 0x02) != 0;
       conn.phy_instant = c[3] | (c[4] << 8);
       conn.phy_pending = true;
       break;
-    case 0x02:   // LL_TERMINATE_IND: дослушаем до таймаута, это безопасно
+    case 0x02:   // LL_TERMINATE_IND: keep listening until the timeout, that's safe
       break;
   }
 }
 
 //--------------------------------------------------------------------+
-// Прерывания
+// Interrupts
 //--------------------------------------------------------------------+
 void RADIO_IRQHandler(void) {
   if (!NRF_RADIO->EVENTS_END) return;
@@ -333,7 +332,7 @@ void RADIO_IRQHandler(void) {
   uint8_t len = rxbuf[1];
   uint16_t total = (uint16_t) (2 + len);
 
-  // Копируем сразу: END_START уже снова включил приём в тот же буфер
+  // Copy right away: END_START has already restarted reception into the same buffer
   uint32_t h = ring_head;
   pkt_t *pk = NULL;
   if (h - ring_tail < RING) {
@@ -358,8 +357,8 @@ void RADIO_IRQHandler(void) {
       enter_conn(rxbuf[0], p, t_end);
       return;
     }
-    // ADV_IND / ADV_NONCONN_IND / ADV_SCAN_IND / SCAN_RSP от шифтера: через 250 мкс на следующий канал,
-    // если за это время не начался ответ (CONNECT_IND или SCAN_REQ)
+    // ADV_IND / ADV_NONCONN_IND / ADV_SCAN_IND / SCAN_RSP from the target: move to the next channel after 250 us
+    // unless a reply (CONNECT_IND or SCAN_REQ) has started by then
     if (crcok && (type == 0x00 || type == 0x02 || type == 0x04 || type == 0x06) && len >= 6 &&
         memcmp(p, TARGET, 6) == 0) {
       scan_armed_at = t_end;
@@ -390,7 +389,7 @@ void TIMER0_IRQHandler(void) {
 
   unschedule();
   if (!scan_hop_armed) return;
-  // Если после рекламы уже пошёл новый пакет, дождёмся его конца
+  // If a new packet has started after the advertisement, wait for its end
   if ((int32_t) (NRF_TIMER0->CC[1] - scan_armed_at) > 0) {
     scan_armed_at = NRF_TIMER0->CC[1];
     schedule(now_us() + 400);
@@ -437,7 +436,7 @@ int main(void) {
   while (1) {
     tud_task();
 
-    // Пока Мак не открыл порт, пакеты не копим
+    // Don't queue packets until the Mac opens the port
     if (!tud_cdc_connected()) ring_tail = ring_head;
 
     while (ring_tail != ring_head) {
@@ -467,7 +466,7 @@ int main(void) {
     }
     tud_cdc_write_flush();
 
-    // Команды с Мака: "r" — бросить соединение и снова искать цель; "t aabbccddeeff" — новая цель
+    // Commands from the Mac: "r" drops the connection and looks for the target again; "t aabbccddeeff" sets a new target
     static char cmd[32];
     static int cmd_len;
     while (tud_cdc_available()) {

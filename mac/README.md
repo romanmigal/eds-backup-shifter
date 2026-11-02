@@ -1,28 +1,44 @@
-# wheeltop-shifter для Mac
+# Mac tools
 
-Mac притворяется шифтером (подом) WHEELTOP EDS по BLE и шлёт заднему переключателю (RD)
-кадры кнопок. Протокол описан в `../wheeltop_eds_protocol_spec.md`.
+Build all of them with `./build.sh`. On first run macOS asks for Bluetooth access for Terminal.
 
-## Сборка и запуск
+## rd-app
+
+The Mac connects to the derailleur the way the Wheeltop phone app does and shifts gears.
+The native shifter stays paired. Keys: `u` up, `d` down, `q` quit.
 
 ```sh
-./build.sh
-./wheeltop-shifter                 # OX-под (3-байтовые кадры)
-./wheeltop-shifter --type tx-right # TX-под (4 байта + статус-кадр раз в секунду)
+./rd-app
 ```
 
-Клавиши: `↑`/`k`/`+` поднимают передачу, `↓`/`j`/`-` опускают, `t` переключает fine-tune, `q` выходит.
-При первом запуске macOS спросит доступ к Bluetooth для Терминала.
+## board-buttons
 
-Все записи и чтения со стороны RD печатаются в лог (`ЗАПИСЬ от RD → …`). Это главный материал
-для доработки протокола.
+Two big on-screen buttons (and the ↑/↓ keys) that shift through the ESP32 board over USB.
+Works in both board modes.
 
-## Ограничения (не проверено на железе)
+```sh
+./board-buttons [/dev/cu.usbmodemXXX]
+```
 
-- **macOS не даёт рекламировать manufacturer data.** Мак виден только с именем и UUID сервиса NUS,
-  без префикса `07 0f 00 14 55 6a 84` и байта типа. Если RD ищет под по этому префиксу, он Мак не найдёт.
-- RD может помнить MAC-адрес своего пода или требовать bonding. Тогда эмулятор тоже не примут.
-- Настоящий под должен быть выключен, иначе RD подключится к нему.
+## wheeltop-shifter
 
-Если RD Мак не видит, следующий шаг — ESP32 за ~5 $: он рекламирует полную manufacturer data,
-а Мак управляет им по USB.
+The original experiment: the Mac pretends to be the shifter (pod). It also controls the ESP32 board and
+records a real pod.
+
+```sh
+./wheeltop-shifter                 # Mac as an OX pod (3-byte frames)
+./wheeltop-shifter --type tx-right # Mac as a TX pod
+./wheeltop-shifter --esp32 [PORT]  # control the ESP32 board over USB
+./wheeltop-shifter --listen        # connect to a real pod and record its frames
+./wheeltop-shifter --scan          # show all BLE devices nearby
+```
+
+Keys: `↑`/`k`/`+` shift up, `↓`/`j`/`-` shift down, `t` toggles fine-tune, `q` quits.
+
+Limitation: macOS doesn't let an app advertise manufacturer data, so the Mac is visible only with a name and
+the NUS service UUID, without the pod prefix `07 0f 00 14 55 6a 84`. The derailleur doesn't connect to it,
+which is why the ESP32 board exists.
+
+## dongle_sniff.py
+
+Reads the nRF52840 dongle sniffer. See [../SNIFFER.md](../SNIFFER.md).

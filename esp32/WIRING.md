@@ -1,114 +1,99 @@
-# Кнопки и питание для ESP32-C3 SuperMini
+# Buttons and power for the ESP32-C3 SuperMini
 
-Плата работает сама, без компьютера: две кнопки переключают передачи, аккумулятор питает плату.
+The board works on its own, without a computer: two buttons shift gears and a battery powers it.
+A computer is only needed to flash the firmware.
 
-**Проверено 2026-11-02:** плата от внешнего питания, без Мака. Касание проводком ножек `4`/`5` с `GND`
-переключает передачи, короткие и длинные нажатия работают. После этого родной шифтер подключается без нового сопряжения.
-Прошивка `wheeltop_pod` уже умеет это. Компьютер нужен только для прошивки и настройки.
+**Verified:** on external power without a computer, the buttons shift (2026-11-02, pod mode). In app mode the
+board's buttons and the native shifter shift in any order, and the shifter stays paired (2026-11-03).
 
-## Что купить
+## Parts
 
-| Деталь | Сколько | Зачем |
+| Part | Qty | Why |
 |---|---|---|
-| Кнопка без фиксации (нормально разомкнутая), например тактовая 6×6 мм или влагозащищённая на руль | 2 | вверх и вниз |
-| Движковый переключатель (SPDT) | 1, по желанию | положение R/T, как ползунок на поде |
-| Аккумулятор LiPo 3,7 В, 300–1000 мА·ч, **с платой защиты** | 1 | питание |
-| Модуль зарядки TP4056 **с защитой** (6 контактов: IN, B+, B−, OUT+, OUT−) | 1 | заряжать аккумулятор от USB |
-| Диод Шоттки 1N5817 или SS14 | 1 | чтобы USB не бил в аккумулятор |
-| Выключатель питания (любой маленький) | 1 | включать и выключать плату |
-| Провода, термоусадка | | |
+| Momentary push button (normally open), e.g. a 6×6 mm tactile switch or a waterproof handlebar button | 2 | up and down |
+| Slide switch (SPDT) | 1, optional | R/T position like the pod's slider (pod mode only) |
+| 3.7 V LiPo battery, 300–1000 mAh, **with a protection circuit** | 1 | power |
+| TP4056 charger module **with protection** (6 pins: IN, B+, B−, OUT+, OUT−) | 1 | charge the battery from USB |
+| Schottky diode 1N5817 or SS14 | 1 | keeps USB power out of the battery |
+| Power switch (any small one) | 1 | turn the board on and off |
+| Wires, heat shrink | | |
 
-## Кнопки
+## Buttons
 
-Каждая кнопка ставится между ножкой платы и `GND`. Резисторы не нужны: подтяжка включена в прошивке.
+Each button goes between a board pin and `GND`. No resistors are needed: the firmware enables the pull-ups.
 
 ```
           ESP32-C3 SuperMini
          ┌───────────────────┐
-  ВВЕРХ ─┤ 4             GND ├─┬───── общий провод всех кнопок
-  ВНИЗ  ─┤ 5                 │ │
+  UP    ─┤ 4             GND ├─┬───── common wire of all buttons
+  DOWN  ─┤ 5                 │ │
   R/T   ─┤ 6                 │ │
          └───────────────────┘ │
                                │
-  кнопка ВВЕРХ:  ножка 4 ──[ кнопка ]── GND
-  кнопка ВНИЗ:   ножка 5 ──[ кнопка ]── GND
-  переключатель: ножка 6 ──[ замкнут = T, разомкнут = R ]── GND
+  UP button:   pin 4 ──[ button ]── GND
+  DOWN button: pin 5 ──[ button ]── GND
+  switch:      pin 6 ──[ closed = T, open = R ]── GND
 ```
 
-- Ножки подписаны на плате цифрами `4`, `5`, `6`. `GND` на SuperMini есть с обеих сторон, подойдёт любой.
-- Переключатель R/T можно не ставить. Тогда всегда положение R (обычное переключение).
-- Проверка без пайки: коснитесь проводком от ножки `4` до `GND`. Это передача вверх.
+- The pins are labelled `4`, `5`, `6` on the board. The SuperMini has `GND` on both sides; either works.
+- The R/T switch is optional. Without it the board is always in R (normal shifting).
+- Test without soldering: touch a wire from pin `4` to `GND`. That shifts up.
 
-## Питание от аккумулятора
+## Battery power
 
 ```
-  LiPo +  ──── B+   TP4056   OUT+ ──[ выключатель ]──▶|── 5V   SuperMini
-  LiPo −  ──── B−            OUT− ──────────────────────── GND
-                     (USB-C модуля: зарядка)            диод: полоска к 5V
+  LiPo +  ──── B+   TP4056   OUT+ ──[ switch ]──▶|── 5V   SuperMini
+  LiPo −  ──── B−            OUT− ─────────────────── GND
+                 (module USB-C: charging)       diode: stripe towards 5V
 ```
 
-1. Аккумулятор к `B+` и `B−` модуля TP4056.
-2. `OUT+` через выключатель на **анод** диода, **катод** (сторона с полоской) на ножку `5V` платы.
-3. `OUT−` на `GND` платы.
+1. Battery to `B+` and `B−` of the TP4056 module.
+2. `OUT+` through the switch to the diode's **anode**; the **cathode** (striped side) to the board's `5V` pin.
+3. `OUT−` to the board's `GND`.
 
-Почему так:
+Why:
 
-- **Ножка `5V`, а не `3V3`.** Через `5V` питание идёт через стабилизатор платы. Аккумулятор даёт до 4,2 В,
-  а на `3V3` больше 3,6 В подавать нельзя: чип сгорит.
-- **Диод.** На SuperMini ножка `5V` соединена с USB напрямую. Без диода, если подключить плату к Маку
-  при включённом аккумуляторе, 5 В из USB пойдут в выход модуля зарядки и в аккумулятор.
-- **Заряжать** через USB-разъём модуля TP4056, не через разъём платы.
-- Модуль **с защитой** отключит аккумулятор, когда тот разрядится, и не даст его испортить.
+- **The `5V` pin, not `3V3`.** Power on `5V` goes through the board's regulator. The battery gives up to 4.2 V,
+  and `3V3` must not see more than 3.6 V or the chip dies.
+- **The diode.** On the SuperMini the `5V` pin is wired straight to USB. Without the diode, plugging the board
+  into a computer with the battery switched on would push 5 V from USB into the charger output and the battery.
+- **Charge** through the TP4056 module's USB port, not the board's.
+- A module **with protection** cuts off the battery when it is empty and keeps it from being damaged.
 
-Проще, без пайки питания: воткнуть в USB-C платы powerbank. Минус: многие powerbank сами выключаются,
-когда ток меньше ~50 мА, а плата берёт меньше. Нужен powerbank с режимом малого тока.
+Simpler, without soldering the power: plug a power bank into the board's USB-C. The catch: many power banks
+switch off when the current is below ~50 mA, and the board draws less. You need one with a low-current mode.
 
-## Как понять, что работает
+## Getting started
 
-Синий светодиод на плате (красный это просто питание):
+1. Flash the firmware ([README.md](README.md)).
+2. Power the board. The blue LED blinks fast: the board is pairing.
+3. Wake the derailleur by moving the bike, keep the board close to it. After a few seconds the LED stays on.
+4. Press the buttons.
 
-| Светодиод | Что значит |
-|---|---|
-| короткая вспышка раз в секунду | плата ждёт переключатель |
-| горит постоянно | переключатель подключён, кнопки работают |
+The red LED only shows power. The blue LED is described in [README.md](README.md#pairing-app-mode).
 
-Порядок:
+## Battery life
 
-1. Сопрячь плату вместо шифтера (см. ниже). Батарейку из шифтера вынимать не нужно, если у платы свой адрес.
-2. Включить плату и разбудить переключатель (покачать велосипед).
-3. Дождаться, пока светодиод загорится постоянно, и нажимать кнопки.
+Not measured. By the datasheet an ESP32-C3 with Bluetooth active draws around 20–40 mA, plus the red LED.
+Rough guide: 12–20 hours from a 500 mAh battery. Switch the board off when you're not riding.
+Removing the red LED extends it a little.
 
-## Сколько проработает
+## Pins to avoid
 
-Не измерено. По паспорту ESP32-C3 с активным Bluetooth берёт порядка 20–40 мА, плюс красный светодиод.
-Ориентир: аккумулятор 500 мА·ч на 12–20 часов. Выключайте плату выключателем, когда не катаетесь.
-Красный светодиод можно выпаять, это немного продлит работу.
+`8` and `9` take part in booting (`9` is the BOOT button), `20` and `21` are the debug UART, and `18` and `19`
+are USB. If pins `4`–`6` are needed for something else, `0`, `1`, `3`, `7`, `10` work: change `PIN_UP`,
+`PIN_DOWN`, `PIN_FINE` at the top of `wheeltop_pod.ino`.
 
-## Ножки, которые лучше не трогать
+## Pod mode
 
-`8` и `9` участвуют в загрузке платы (`9` это кнопка BOOT), `20` и `21` это отладочный UART, а `18` и `19` заняты USB.
-Если ножки `4`–`6` нужны для другого, подойдут `0`, `1`, `3`, `7`, `10`: поменяйте `PIN_UP`, `PIN_DOWN`,
-`PIN_FINE` в начале `wheeltop_pod.ino`.
+In pod mode the board replaces the native shifter. The derailleur remembers only one shifter: whichever was
+paired last works, the other is ignored.
 
-## Плата и родной шифтер одновременно (режим приложения)
+1. Once, over USB: `mode pod`. Give the board its own address and the TX Right type:
+   `mac c0:00:00:00:00:02 random` (any random static address, i.e. the first byte `c0`–`ff`), then `type tx-right`.
+   Never give the board the native shifter's address while the shifter has its battery in.
+2. Pair the board: plug power into the derailleur briefly to start pairing; after a couple of seconds
+   (the derailleur has connected to the board) press a board button. You have about 8 seconds.
+3. Back to the native shifter: plug power into the derailleur and press a button on the shifter.
 
-Проверено 2026-11-03: кнопки платы и родной шифтер переключают передачи вперемешку, ничего не слетает.
-
-1. Один раз, с Мака: `mode app` (плата перезагрузится). Обратно: `mode pod`.
-2. Переключатель остаётся сопряжённым с родным шифтером. Плату сопрягать не нужно: она сама находит
-   переключатель (`EDS OX…`) и подключается к нему, как приложение на телефоне. Светодиод горит — можно переключать.
-
-Пока плата подключена, приложение на телефоне к переключателю, скорее всего, не подключится (не проверялось).
-
-## Плата и родной шифтер без вынимания батареек (режим шифтера)
-
-Переключатель помнит один шифтер. Работает тот, который сопряжён последним, второй он не видит.
-
-1. У платы должен быть **свой** адрес и тип TX Right (один раз, с Мака):
-   `mac c0:00:00:00:00:02 random`, затем `type tx-right`.
-   С адресом шифтера (`…:94`) плату и шифтер одновременно включать нельзя.
-2. Сопрячь плату: подключить питание к переключателю, через пару секунд (переключатель уже подключился к плате)
-   нажать кнопку платы. На это около 8 секунд.
-3. Вернуться на родной шифтер: подключить питание к переключателю и нажать кнопку на шифтере.
-
-Тип TX Left (`0x36`) переключатель в режиме сопряжения не принимает.
+The derailleur doesn't accept the TX Left type (`0x36`) when pairing.
