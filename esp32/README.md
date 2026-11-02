@@ -4,14 +4,22 @@ Firmware for an ESP32 board with two buttons that shifts a WHEELTOP EDS rear der
 
 Any board with Bluetooth LE works: ESP32, ESP32-C3, ESP32-S3 (not ESP32-S2, it has no Bluetooth).
 For a standalone board with buttons and a battery, see [WIRING.md](WIRING.md) (ESP32-C3 SuperMini).
+The Android app in [../android](../android) pairs the board and switches its mode over Bluetooth, and shifts gears
+straight from the phone.
 
 ## Two modes
 
 - **app** (default, verified 2026-11-03): the board connects to the derailleur the way the Wheeltop phone app
   does. The native shifter stays paired and keeps working, so both can be used at the same time.
   A press shifts once; a held button shifts again every 0.3 s after 0.54 s. There is no fine-tune in this mode.
-- **pod** (`mode pod`): the board pretends to be the shifter (pod). The derailleur has to be paired with the board
-  instead of the native shifter. Kept for protocol research; see [WIRING.md](WIRING.md#pod-mode).
+  The derailleur takes only one app at a time, so while the Android app (`android/`) is connected to the board,
+  the board leaves the derailleur to the phone and sends its button presses to the phone instead. The LED then blinks
+  slowly (1 s on, 1 s off).
+- **pod** (`mode pod`): the board pretends to be the shifter (pod) with its own address. The derailleur has to be
+  paired with the board instead of the native shifter; see [WIRING.md](WIRING.md#pod-mode).
+
+The board remembers the mode. Its BLE address is a random static address made from the chip's MAC, so every
+board has its own address.
 
 ## Pairing (app mode)
 

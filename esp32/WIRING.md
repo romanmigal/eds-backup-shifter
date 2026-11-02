@@ -89,11 +89,12 @@ are USB. If pins `4`–`6` are needed for something else, `0`, `1`, `3`, `7`, `1
 In pod mode the board replaces the native shifter. The derailleur remembers only one shifter: whichever was
 paired last works, the other is ignored.
 
-1. Once, over USB: `mode pod`. Give the board its own address and the TX Right type:
-   `mac c0:00:00:00:00:02 random` (any random static address, i.e. the first byte `c0`–`ff`), then `type tx-right`.
-   Never give the board the native shifter's address while the shifter has its battery in.
+1. Switch the board to shifter mode in the Android app, or send `mode pod` over USB. The board advertises as a
+   TX Right shifter with its own address (made from the chip's MAC). Never give the board the native shifter's
+   address with `mac` while the shifter has its battery in.
 2. Pair the board: plug power into the derailleur briefly to start pairing; after a couple of seconds
-   (the derailleur has connected to the board) press a board button. You have about 8 seconds.
+   (the derailleur has connected to the board) press a board button or "Press shifter button" in the app.
+   You have about 8 seconds.
 3. Back to the native shifter: plug power into the derailleur and press a button on the shifter.
 
 The derailleur doesn't accept the TX Left type (`0x36`) when pairing.

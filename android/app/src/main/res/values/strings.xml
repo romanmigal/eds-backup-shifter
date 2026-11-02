@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WT Board</string>
+    <string name="need_permission">Allow Nearby devices (Bluetooth) to find the derailleur and the board.</string>
+    <string name="bluetooth_off">Turn on Bluetooth.</string>
+    <string name="rd_connected">Derailleur: connected</string>
+    <string name="rd_connecting">Derailleur: connecting…</string>
+    <string name="rd_searching">Derailleur: searching… move the bike to wake it</string>
+    <string name="board_connected">Board: connected</string>
+    <string name="board_searching">Board: searching…</string>
+    <string name="board_yielded">Board: connected, its buttons shift through the phone</string>
+    <string name="board_pairing">Board: pairing, wake the derailleur</string>
+    <string name="up">▲  Up</string>
+    <string name="down">▼  Down</string>
+    <string name="gear">Gear %1$s</string>
+    <string name="mode_title">Board mode</string>
+    <string name="mode_app">Like the phone app</string>
+    <string name="mode_pod">Like a shifter, with its own address</string>
+    <string name="mode_confirm_pod">Switch the board to shifter mode?\n\nThe board replaces your shifter: the derailleur has to be paired with the board, and your shifter stops working until you pair it again. The board restarts.</string>
+    <string name="mode_confirm_app">Switch the board to phone app mode?\n\nThe board connects to the derailleur like the Wheeltop app, and your shifter keeps working. If the derailleur was paired with the board, pair your shifter with it again. The board restarts.</string>
+    <string name="pair_button">Pair the board with the derailleur</string>
+    <string name="pair_app_confirm">The board forgets its derailleur and pairs with the nearest one.\n\nWake the derailleur by moving the bike and keep the board close to it.</string>
+    <string name="pair_pod_help">1. Plug the charger into the derailleur for a second: it enters pairing mode.\n2. Within 8 seconds press "Press shifter button": it acts as a button press on the board.</string>
+    <string name="pair_pod_button">Press shifter button</string>
+    <string name="pair">Pair</string>
+    <string name="cancel">Cancel</string>
+    <string name="ok">OK</string>
+    <string name="paired_with">Board paired with %1$s</string>
+</resources>

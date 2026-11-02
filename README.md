@@ -14,12 +14,16 @@ Not affiliated with Wheeltop. The protocol was reverse-engineered; use at your o
    The board pairs with the nearest derailleur and remembers it; the blue LED stays on when connected.
 4. Press the buttons to shift. The stock shifter still works.
 
+The Android app in [android/](android/) shifts gears straight from the phone (no board needed), and pairs the board
+and switches its mode.
+
 ## Contents
 
 | Path | What |
 |---|---|
 | [wheeltop_eds_protocol_spec.md](wheeltop_eds_protocol_spec.md) | the protocols: shifter → derailleur and app → derailleur |
 | [esp32/](esp32/) | board firmware (Arduino, NimBLE-Arduino) and wiring |
+| [android/](android/) | Android app: shift from the phone, pair the board, choose its mode |
 | [mac/](mac/) | macOS tools: the Mac as the app (`rd-app`), on-screen buttons for the board, the original pod emulator |
 | [dongle/](dongle/), [SNIFFER.md](SNIFFER.md) | BLE sniffer firmware for the nRF52840 Dongle that follows CSA #2 connections |
 

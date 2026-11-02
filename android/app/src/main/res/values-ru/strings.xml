@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="need_permission">Разрешите доступ к устройствам поблизости (Bluetooth), чтобы найти переключатель и плату.</string>
+    <string name="bluetooth_off">Включите Bluetooth.</string>
+    <string name="rd_connected">Переключатель: подключён</string>
+    <string name="rd_connecting">Переключатель: подключаюсь…</string>
+    <string name="rd_searching">Переключатель: ищу… покачайте велосипед</string>
+    <string name="board_connected">Плата: подключена</string>
+    <string name="board_searching">Плата: ищу…</string>
+    <string name="board_yielded">Плата: подключена, её кнопки переключают через телефон</string>
+    <string name="board_pairing">Плата: сопряжение, разбудите переключатель</string>
+    <string name="up">▲  Вверх</string>
+    <string name="down">▼  Вниз</string>
+    <string name="gear">Передача %1$s</string>
+    <string name="mode_title">Режим платы</string>
+    <string name="mode_app">Как телефон</string>
+    <string name="mode_pod">Как шифтер, со своим адресом</string>
+    <string name="mode_confirm_pod">Перевести плату в режим шифтера?\n\nПлата заменит ваш шифтер: переключатель нужно сопрячь с платой, а ваш шифтер не будет работать, пока его снова не сопрягут. Плата перезагрузится.</string>
+    <string name="mode_confirm_app">Перевести плату в режим телефона?\n\nПлата подключается к переключателю как приложение Wheeltop, ваш шифтер продолжает работать. Если переключатель был сопряжён с платой, снова сопрягите с ним свой шифтер. Плата перезагрузится.</string>
+    <string name="pair_button">Сопрячь плату с переключателем</string>
+    <string name="pair_app_confirm">Плата забудет свой переключатель и сопряжётся с ближайшим.\n\nРазбудите переключатель, покачав велосипед, и держите плату рядом с ним.</string>
+    <string name="pair_pod_help">1. На секунду подключите зарядку к переключателю: он перейдёт в режим сопряжения.\n2. В течение 8 секунд нажмите «Нажать кнопку шифтера»: это как нажатие кнопки на плате.</string>
+    <string name="pair_pod_button">Нажать кнопку шифтера</string>
+    <string name="pair">Сопрячь</string>
+    <string name="cancel">Отмена</string>
+    <string name="ok">ОК</string>
+    <string name="paired_with">Плата сопряжена с %1$s</string>
+</resources>

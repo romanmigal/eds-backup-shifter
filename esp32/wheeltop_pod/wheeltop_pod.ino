@@ -7,8 +7,13 @@
 //   pod            The board pretends to be the shifter (pod). The RD must be paired with the board instead
 //                  of the native shifter. Kept for protocol research.
 //
-// The board is controlled over USB serial (115200, lines ending in \n) or with buttons on pins 4 and 5
-// (wiring in ../WIRING.md). Protocol: ../../wheeltop_eds_protocol_spec.md
+// The board is controlled with buttons on pins 4 and 5 (wiring in ../WIRING.md), over USB serial
+// (115200, lines ending in \n) or from the Android app (../../android) over BLE: the board advertises as
+// "WT Board" with a settings service whose command characteristic takes the u, d, pair and mode commands
+// and whose status characteristic reports the state. Protocol: ../../wheeltop_eds_protocol_spec.md
+//
+// The board's BLE address is a random static address derived from the chip's MAC, so every board has
+// its own address in pod mode too.
 //
 // Commands:
 //   u / d              shift up / down
@@ -36,6 +41,12 @@
 static const char *SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *RDWRITE_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write, write-nr
 static const char *BUTTONS_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+// Settings service for the Android app
+static const char *CFG_SERVICE_UUID = "b5f90001-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
+static const char *CFG_COMMAND_UUID = "b5f90002-1a2b-4c3d-8e9f-0a1b2c3d4e5f"; // write: a command line
+static const char *CFG_STATUS_UUID = "b5f90003-1a2b-4c3d-8e9f-0a1b2c3d4e5f";  // read, notify: status
+static const char *CFG_EVENT_UUID = "b5f90004-1a2b-4c3d-8e9f-0a1b2c3d4e5f";   // notify: "u"/"d" button presses
+static const char *BOARD_NAME = "WT Board";
 
 // Advertisement of a real TX Right pod: company id ff ff, prefix, type 0x38, firmware 5.7, battery,
 // unknown bytes and, in the last 6 bytes, the address of the RD the pod is paired with (little-endian).
@@ -60,6 +71,8 @@ uint8_t rdType;
 
 volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE; // pod mode: connection from the RD
 volatile int subscribers = 0;
+volatile int periphConns = 0;  // connections where the board is the peripheral: the RD in pod mode and phones
+uint32_t advDueAt = 0;         // restart advertising at this time (0: not scheduled)
 uint8_t ownAddrType = BLE_OWN_ADDR_PUBLIC;
 bool fineTune = false;
 // Like the real pod (sniffer, 2026-11-02): it answers the RD's 20-byte write to …0002 with an empty notify
@@ -162,6 +175,31 @@ const char *typeName(uint8_t t) {
 
 bool isWheeltop(const std::string &m) { return prefixOffset((const uint8_t *)m.data(), m.size()) >= 0; }
 
+bool phoneConnected() { return periphConns > (rdConnected() ? 1 : 0); }
+
+// The RD takes only one app-style central, so in app mode the board leaves the RD to a phone app that is
+// subscribed to button events, and forwards its button presses to it. Phones subscribed to the event characteristic:
+static const int MAX_PHONES = 3;
+volatile uint16_t eventConns[MAX_PHONES] = {BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE};
+
+void setEventConn(uint16_t conn, bool on) {
+  for (int i = 0; i < MAX_PHONES; i++)
+    if (eventConns[i] == conn) eventConns[i] = BLE_HS_CONN_HANDLE_NONE;
+  if (!on) return;
+  for (int i = 0; i < MAX_PHONES; i++)
+    if (eventConns[i] == BLE_HS_CONN_HANDLE_NONE) { eventConns[i] = conn; return; }
+}
+
+bool phoneListening() {
+  for (int i = 0; i < MAX_PHONES; i++)
+    if (eventConns[i] != BLE_HS_CONN_HANDLE_NONE) return true;
+  return false;
+}
+
+// Commands from the phone are executed in loop(), not in the BLE task: some of them block or restart.
+portMUX_TYPE cmdLock = portMUX_INITIALIZER_UNLOCKED;
+std::vector<String> phoneCmds;
+
 // ---------- pod GATT, handle for handle like the real pod ----------
 // NimBLEServer always adds its own characteristics to services 1800 and 1801, which shifts the handles.
 // The RD seems to write to the pod's remembered handles, so the table is built by hand
@@ -169,12 +207,13 @@ bool isWheeltop(const std::string &m) { return prefixOffset((const uint8_t *)m.d
 //   0x0001 1800  0x0003 2A00 "EDS TX" read/write, 0x0005 2A01, 0x0007 2A04, 0x0009 2AA6
 //   0x000a 1801  empty
 //   0x000b NUS   0x000d …0002 write/write-nr, 0x000f …0003 notify, 0x0010 CCCD
+// The settings service comes after them, so the pod's handles stay the same.
 
 static ble_uuid16_t uuidGap, uuidGatt, uuidName, uuidAppearance, uuidPpcp, uuidCar;
-static ble_uuid128_t uuidNus, uuidRdWrite, uuidButtons;
-static ble_gatt_chr_def gapChrs[5], nusChrs[3];
-static ble_gatt_svc_def podSvcs[4];
-static uint16_t hName, hAppearance, hPpcp, hCar, hRdWrite, hButtons;
+static ble_uuid128_t uuidNus, uuidRdWrite, uuidButtons, uuidCfg, uuidCfgCommand, uuidCfgStatus, uuidCfgEvent;
+static ble_gatt_chr_def gapChrs[5], nusChrs[3], cfgChrs[4];
+static ble_gatt_svc_def podSvcs[5];
+static uint16_t hName, hAppearance, hPpcp, hCar, hRdWrite, hButtons, hCfgCommand, hCfgStatus, hCfgEvent;
 static char devName[32] = "EDS TX";
 static const uint8_t APPEARANCE[] = {0x00, 0x00};
 static const uint8_t PPCP[] = {0x20, 0x00, 0x40, 0x00, 0x04, 0x00, 0xc8, 0x00}; // 40–80 ms, latency 4, timeout 2 s
@@ -216,10 +255,33 @@ int nusAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *ar
     uint16_t len = 0;
     ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof buf, &len);
     logEvent("WRITE by RD -> 0x%04x: %s\n", attr, hex(buf, len).c_str());
-    if (attr == hRdWrite && len == 20) ackPending = true;
+    if (attr == hRdWrite && len == 20) {
+      if (!appMode && !rdConnected()) connHandle = conn; // the RD may skip subscribing on a reconnect
+      ackPending = true;
+    }
     return 0;
   }
   return BLE_ATT_ERR_READ_NOT_PERMITTED;
+}
+
+String statusText();
+
+int cfgAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *arg) {
+  if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && attr == hCfgStatus) {
+    String st = statusText();
+    return os_mbuf_append(ctxt->om, st.c_str(), st.length()) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && attr == hCfgCommand) {
+    char buf[32];
+    uint16_t len = 0;
+    ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof buf - 1, &len);
+    buf[len] = 0;
+    portENTER_CRITICAL(&cmdLock);
+    if (phoneCmds.size() < 8) phoneCmds.push_back(buf);
+    portEXIT_CRITICAL(&cmdLock);
+    return 0;
+  }
+  return BLE_ATT_ERR_UNLIKELY;
 }
 
 void startAdv();
@@ -231,13 +293,18 @@ int gapEvent(ble_gap_event *ev, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
       // Sometimes the status is not 0 but the link exists anyway (the RD then changes the MTU and subscribes),
       // so we trust the connection, not the status.
+      // A central is the RD (pod mode) or a phone. The RD is recognised by its stored address or, when pairing,
+      // by subscribing to the button characteristic.
       if (ev->connect.status == 0 || ble_gap_conn_find(ev->connect.conn_handle, &desc) == 0) {
-        connHandle = ev->connect.conn_handle;
-        if (ble_gap_conn_find(connHandle, &desc) == 0) {
-          logEvent("Central connected %s, status %d, handle %d\n", NimBLEAddress(desc.peer_id_addr).toString().c_str(),
-                   ev->connect.status, connHandle);
-          saveRd(NimBLEAddress(desc.peer_id_addr)); // the pod advertises the address of its RD
+        periphConns++;
+        if (ble_gap_conn_find(ev->connect.conn_handle, &desc) == 0) {
+          NimBLEAddress peer(desc.peer_id_addr);
+          logEvent("Central connected %s, status %d, handle %d\n", peer.toString().c_str(), ev->connect.status,
+                   ev->connect.conn_handle);
+          if (!appMode && rdStr.length() && peer == NimBLEAddress(rdStr.c_str(), rdType)) connHandle = ev->connect.conn_handle;
         }
+        // Like the real pod, don't advertise while the RD is still setting up the link.
+        advDueAt = (millis() + 2000) | 1;
       } else {
         logEvent("Connection failed: %d\n", ev->connect.status);
         startAdv();
@@ -245,16 +312,26 @@ int gapEvent(ble_gap_event *ev, void *arg) {
       break;
     case BLE_GAP_EVENT_DISCONNECT:
       logEvent("Disconnected, reason 0x%03x\n", ev->disconnect.reason);
-      connHandle = BLE_HS_CONN_HANDLE_NONE;
-      subscribers = 0;
-      connectedAt = 0;
-      paramsRequested = false;
+      if (periphConns > 0) periphConns--;
+      setEventConn(ev->disconnect.conn.conn_handle, false);
+      if (ev->disconnect.conn.conn_handle == connHandle) {
+        connHandle = BLE_HS_CONN_HANDLE_NONE;
+        subscribers = 0;
+        connectedAt = 0;
+        paramsRequested = false;
+      }
       startAdv(); // the real pod advertises again right after a disconnect
       break;
     case BLE_GAP_EVENT_SUBSCRIBE:
       logEvent("Subscription to 0x%04x: notify=%d\n", ev->subscribe.attr_handle, ev->subscribe.cur_notify);
-      if (!rdConnected()) connHandle = ev->subscribe.conn_handle;
-      if (ev->subscribe.attr_handle == hButtons) subscribers = ev->subscribe.cur_notify;
+      if (ev->subscribe.attr_handle == hCfgEvent) setEventConn(ev->subscribe.conn_handle, ev->subscribe.cur_notify);
+      if (ev->subscribe.attr_handle == hButtons && !appMode) {
+        connHandle = ev->subscribe.conn_handle;
+        subscribers = ev->subscribe.cur_notify;
+        if (ble_gap_conn_find(connHandle, &desc) == 0) saveRd(NimBLEAddress(desc.peer_id_addr));
+        advDueAt = 0;
+        startAdv();
+      }
       break;
     case BLE_GAP_EVENT_ENC_CHANGE:
       logEvent("Pairing: encryption, status %d\n", ev->enc_change.status);
@@ -264,11 +341,10 @@ int gapEvent(ble_gap_event *ev, void *arg) {
       logEvent("Pairing: the RD asks again, old key deleted\n");
       return BLE_GAP_REPEAT_PAIRING_RETRY;
     case BLE_GAP_EVENT_MTU:
-      if (!rdConnected()) connHandle = ev->mtu.conn_handle; // the link exists even if CONNECT came with an error
       logEvent("MTU %d, handle %d\n", ev->mtu.value, ev->mtu.conn_handle);
       break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
-      if (!rdConnected()) startAdv();
+      startAdv();
       break;
     case BLE_GAP_EVENT_NOTIFY_TX:
       break;
@@ -278,12 +354,32 @@ int gapEvent(ble_gap_event *ev, void *arg) {
   return 0;
 }
 
-// Like the real pod: manufacturer data only, no flags, name or service UUID, no scan response.
+// Pod mode without the RD: like the real pod, manufacturer data only, no flags or service UUID; the scan
+// response carries the board's name so the phone app can find it. Otherwise, while no phone is connected:
+// the settings service UUID and the name, for the phone app.
+enum AdvKind { ADV_NONE, ADV_POD, ADV_SETTINGS };
+AdvKind advKind = ADV_NONE;
+
 void startAdv() {
-  if (ble_gap_adv_active()) return;
-  std::vector<uint8_t> raw = {(uint8_t)(mfr.size() + 1), 0xff};
-  raw.insert(raw.end(), mfr.begin(), mfr.end());
+  AdvKind want = (!appMode && !rdConnected()) ? ADV_POD : phoneConnected() ? ADV_NONE : ADV_SETTINGS;
+  if (ble_gap_adv_active()) {
+    if (want == advKind) return;
+    ble_gap_adv_stop();
+  }
+  advKind = want;
+  if (want == ADV_NONE) return;
+  std::vector<uint8_t> raw;
+  if (want == ADV_POD) {
+    raw = {(uint8_t)(mfr.size() + 1), 0xff};
+    raw.insert(raw.end(), mfr.begin(), mfr.end());
+  } else {
+    raw = {0x02, 0x01, 0x06, 0x11, 0x07};
+    raw.insert(raw.end(), uuidCfg.value, uuidCfg.value + 16);
+  }
   ble_gap_adv_set_data(raw.data(), raw.size());
+  std::vector<uint8_t> rsp = {(uint8_t)(strlen(BOARD_NAME) + 1), 0x09};
+  rsp.insert(rsp.end(), BOARD_NAME, BOARD_NAME + strlen(BOARD_NAME));
+  ble_gap_adv_rsp_set_data(rsp.data(), rsp.size());
   ble_gap_adv_params params = {};
   params.conn_mode = BLE_GAP_CONN_MODE_UND;
   params.disc_mode = BLE_GAP_DISC_MODE_GEN;
@@ -301,6 +397,10 @@ void registerPodGatt() {
   setUuid128(uuidNus, SERVICE_UUID);
   setUuid128(uuidRdWrite, RDWRITE_UUID);
   setUuid128(uuidButtons, BUTTONS_UUID);
+  setUuid128(uuidCfg, CFG_SERVICE_UUID);
+  setUuid128(uuidCfgCommand, CFG_COMMAND_UUID);
+  setUuid128(uuidCfgStatus, CFG_STATUS_UUID);
+  setUuid128(uuidCfgEvent, CFG_EVENT_UUID);
 
   memset(gapChrs, 0, sizeof gapChrs);
   gapChrs[0] = {.uuid = &uuidName.u, .access_cb = gapAccess, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE, .val_handle = &hName};
@@ -312,10 +412,16 @@ void registerPodGatt() {
   nusChrs[0] = {.uuid = &uuidRdWrite.u, .access_cb = nusAccess, .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP, .val_handle = &hRdWrite};
   nusChrs[1] = {.uuid = &uuidButtons.u, .access_cb = nusAccess, .flags = BLE_GATT_CHR_F_NOTIFY, .val_handle = &hButtons};
 
+  memset(cfgChrs, 0, sizeof cfgChrs);
+  cfgChrs[0] = {.uuid = &uuidCfgCommand.u, .access_cb = cfgAccess, .flags = BLE_GATT_CHR_F_WRITE, .val_handle = &hCfgCommand};
+  cfgChrs[1] = {.uuid = &uuidCfgStatus.u, .access_cb = cfgAccess, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &hCfgStatus};
+  cfgChrs[2] = {.uuid = &uuidCfgEvent.u, .access_cb = cfgAccess, .flags = BLE_GATT_CHR_F_NOTIFY, .val_handle = &hCfgEvent};
+
   memset(podSvcs, 0, sizeof podSvcs);
   podSvcs[0] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidGap.u, .characteristics = gapChrs};
   podSvcs[1] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidGatt.u}; // empty, like the pod
   podSvcs[2] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidNus.u, .characteristics = nusChrs};
+  podSvcs[3] = {.type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &uuidCfg.u, .characteristics = cfgChrs};
 
   ble_gatts_reset();
   int rc = ble_gatts_count_cfg(podSvcs);
@@ -367,6 +473,16 @@ int pairBestRssi = -1000;
 uint32_t pairFirstSeen = 0;
 
 bool appConnected() { return appClient && appClient->isConnected(); }
+
+// While pairing the board needs the RD itself.
+bool yieldedToPhone() { return appMode && !pairing() && phoneListening(); }
+
+void notifyPhones(const char *s) {
+  for (int i = 0; i < MAX_PHONES; i++) {
+    uint16_t c = eventConns[i];
+    if (c != BLE_HS_CONN_HANDLE_NONE) ble_gatts_notify_custom(c, hCfgEvent, ble_hs_mbuf_from_flat(s, strlen(s)));
+  }
+}
 
 // An RD advertises its own address in manufacturer data after company id ff ff (in display order, not
 // little-endian) and calls itself "EDS OX…". Pods have the prefix 07 0f 00 14 55 6a 84 instead.
@@ -426,6 +542,10 @@ void appHello() {
 }
 
 void appShift(bool up) {
+  if (yieldedToPhone()) {
+    Serial.printf("Shift %s: sent to the phone app\n", up ? "UP" : "DOWN");
+    return notifyPhones(up ? "u" : "d");
+  }
   Serial.printf("Shift %s%s\n", up ? "UP" : "DOWN", haveSession ? "" : ": no session with the RD, skipped");
   if (!haveSession) return;
   uint8_t v = up ? 0x02 : 0x01;
@@ -483,13 +603,28 @@ void appConnect() {
 // Find the RD, connect, search again after a disconnect. If the RD doesn't answer the hello, repeat every 2 s.
 // While pairing, the RD is remembered only after it answers the hello.
 void appLoop() {
-  if (!appConnected()) {
-    if (appWrite) {
-      appWrite = nullptr;
-      haveSession = false;
-      lastGear = -1;
-      logEvent("RD disconnected, searching again\n");
+  static bool yielded = false;
+  if (!appConnected() && appWrite) {
+    appWrite = nullptr;
+    haveSession = false;
+    lastGear = -1;
+    logEvent("RD disconnected%s\n", yieldedToPhone() ? "" : ", searching again");
+  }
+  if (yieldedToPhone()) {
+    if (!yielded) {
+      yielded = true;
+      logEvent("Phone app connected: leaving the RD to it, buttons go to the phone\n");
+      if (appConnected()) appClient->disconnect();
+      NimBLEDevice::getScan()->stop();
+      rdFound = false;
     }
+    return;
+  }
+  if (yielded) {
+    yielded = false;
+    logEvent("Phone app gone: connecting to the RD again\n");
+  }
+  if (!appConnected()) {
     if (pairing() && !rdFound && pairFirstSeen && millis() - pairFirstSeen > PAIR_WINDOW_MS) {
       rdAddr = pairBest;
       rdFound = true;
@@ -568,9 +703,11 @@ void pollFineSwitch() {
 }
 
 // Connected to the RD: steady. Searching: short flash once a second. Pairing: fast blinking.
+// Left the RD to the phone app: slow blinking.
 void updateLed() {
   bool on;
   if (pairing()) on = (millis() % 200) < 100;
+  else if (yieldedToPhone()) on = (millis() % 2000) < 1000; // slow blinking: the phone app has the RD
   else if (appMode ? haveSession : rdConnected()) on = true;
   else on = (millis() % 1000) < 60;
   digitalWrite(PIN_LED, on ? LOW : HIGH);
@@ -588,7 +725,7 @@ void click(bool up) {
 
 class ScanCB : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *d) override {
-    if (appMode && !rdFound && !appConnected() && isRd(d)) {
+    if (appMode && !rdFound && !appConnected() && !yieldedToPhone() && isRd(d)) {
       if (!pairing()) {
         if (d->getAddress() == NimBLEAddress(rdStr.c_str(), rdType)) {
           rdAddr = d->getAddress();
@@ -738,10 +875,24 @@ void restart() {
   ESP.restart();
 }
 
+// Status for the phone app: key=value pairs separated by ';'.
+String statusText() {
+  bool connected = appMode ? appConnected() : rdConnected();
+  String s = String("mode=") + (appMode ? "app" : "pod");
+  s += ";paired=" + (rdStr.length() ? rdStr : String("-"));
+  s += ";rd=" + String(connected ? 1 : 0);
+  s += ";ready=" + String((appMode ? haveSession : rdConnected()) ? 1 : 0);
+  s += ";pairing=" + String(pairing() ? 1 : 0);
+  s += ";yield=" + String(yieldedToPhone() ? 1 : 0);
+  s += ";gear=" + String(lastGear);
+  s += ";addr=" + String(NimBLEDevice::getAddress().toString().c_str());
+  return s;
+}
+
 void printInfo() {
   Serial.printf("Paired RD: %s\n", rdStr.length() ? rdStr.c_str() : "none");
   Serial.printf("BLE address: %s%s\n", NimBLEDevice::getAddress().toString().c_str(),
-                macStr.length() ? " (custom)" : " (factory)");
+                macStr.length() ? " (custom)" : " (from the chip MAC)");
   if (appMode) {
     Serial.printf("Mode: app. RD connected: %s, session: %s, gear: %d\n", appConnected() ? "yes" : "no",
                   haveSession ? "yes" : "no", lastGear);
@@ -856,9 +1007,21 @@ void setup() {
   }
 
   NimBLEDevice::init("");
-  if (macStr.length() && macType == BLE_ADDR_RANDOM) {
+  // Without a custom address the board uses a random static address made from its own MAC:
+  // unique per board and stable across restarts.
+  String own;
+  if (macStr.length()) {
+    if (macType == BLE_ADDR_RANDOM) own = macStr;
+  } else {
+    uint8_t m[6];
+    esp_read_mac(m, ESP_MAC_BT);
+    char a[18];
+    snprintf(a, sizeof a, "%02x:%02x:%02x:%02x:%02x:%02x", m[0] | 0xc0, m[1], m[2], m[3], m[4], m[5]);
+    own = a;
+  }
+  if (own.length()) {
     NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
-    NimBLEDevice::setOwnAddr(NimBLEAddress(macStr.c_str(), BLE_ADDR_RANDOM));
+    NimBLEDevice::setOwnAddr(NimBLEAddress(own.c_str(), BLE_ADDR_RANDOM));
     ownAddrType = BLE_OWN_ADDR_RANDOM;
   }
   // Allow pairing without a PIN: if the RD asks for it, the log shows it.
@@ -866,7 +1029,7 @@ void setup() {
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   registerPodGatt();
-  if (!appMode) startAdv(); // in app mode we don't advertise: the RD stays with the native shifter
+  startAdv();
 
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(new ScanCB(), false);
@@ -893,6 +1056,33 @@ void loop() {
   pollFineSwitch();
   updateLed();
   if (appMode) appLoop();
+  if (advDueAt && (int32_t)(millis() - advDueAt) >= 0) {
+    advDueAt = 0;
+    startAdv();
+  }
+  // Commands from the phone app
+  String cmd;
+  portENTER_CRITICAL(&cmdLock);
+  if (!phoneCmds.empty()) {
+    cmd = phoneCmds.front();
+    phoneCmds.erase(phoneCmds.begin());
+  }
+  portEXIT_CRITICAL(&cmdLock);
+  if (cmd == "u" || cmd == "d" || cmd == "pair" || cmd == "mode app" || cmd == "mode pod") {
+    logEvent("Phone: %s\n", cmd.c_str());
+    handle(cmd);
+  }
+  // Tell the phone when the status changes
+  static String lastStatus;
+  static uint32_t statusAt = 0;
+  if (millis() - statusAt > 300) {
+    statusAt = millis();
+    String st = statusText();
+    if (st != lastStatus) {
+      lastStatus = st;
+      ble_gatts_chr_updated(hCfgStatus);
+    }
+  }
   if (ackPending) {
     ackPending = false;
     static const uint8_t none = 0;

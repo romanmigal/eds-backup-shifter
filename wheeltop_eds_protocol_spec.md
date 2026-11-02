@@ -425,3 +425,17 @@ at random. Plain form: `<session> <command> <length> <data>`.
 `EDS OX…` or its own address in the manufacturer data, connects, subscribes to `…0003`, sends the hello, takes the
 session from the reply, and the buttons send `99 01 02/01`. Verified with the native shifter paired: both work.
 The hello and the `99` commands are enough; the rest of the app's start-up (`fa`, `fb`, `64`, `97`) isn't needed.
+
+## 20. The board's own settings service
+
+The board advertises as `WT Board` (name in the scan response) and has a settings service for the Android app,
+placed after the NUS service so the pod's handles don't change. It is described in `android/README.md`.
+In pod mode the board advertises the pod's manufacturer data (plus the name in the scan response) until the RD
+connects, then the settings service for the phone. It recognises the RD by its stored address or by its
+subscription to the button characteristic; any other central is treated as a phone.
+
+The RD accepts the shifter plus **only one** app-style central (found 2026-11-03): with the board in app mode
+connected, the phone app gets no hello reply. So the board yields: while a phone is subscribed to the event
+characteristic `b5f90004-…` (and the board isn't pairing), the board in app mode disconnects from the RD and stops
+looking for it, reports `yield=1`, and sends its button presses to the phone as `u`/`d` notifications; the phone
+shifts. When the phone unsubscribes or disconnects, the board connects to the RD again.
