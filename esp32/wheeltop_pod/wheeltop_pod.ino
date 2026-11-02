@@ -36,7 +36,6 @@ enum : uint8_t {
   DOWN_PRESSED = 0x01, UP_PRESSED = 0x02,
   DOWN_FINE_PRESSED = 0x05, UP_FINE_PRESSED = 0x06,
   DOWN_RELEASED = 0x09, UP_RELEASED = 0x0a,
-  STATUS_FRAME = 0x10,
 };
 
 Preferences prefs;
@@ -48,7 +47,13 @@ volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE; // соединение 
 volatile int subscribers = 0;
 uint8_t ownAddrType = BLE_OWN_ADDR_PUBLIC;
 bool fineTune = false;
-uint32_t lastStatus = 0;
+// Как у настоящего пода (сниффер, 2026-11-02, mac/sniff12.pcap):
+// на 20 байт от RD в …0002 под отвечает пустым notify на …0003,
+// а примерно через 1,7 с после подключения просит параметры 40–80 мс, latency 4, таймаут 2 с.
+// Статус-кадров раз в секунду настоящий под RD не шлёт.
+volatile bool ackPending = false;
+uint32_t connectedAt = 0;
+bool paramsRequested = false;
 
 // Внешние кнопки на ESP32-C3 SuperMini: кнопка между ножкой и GND, подтяжка внутренняя.
 static const int PIN_UP = 4;     // верхняя кнопка: передача вверх
@@ -193,6 +198,7 @@ int nusAccess(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt *ctxt, void *ar
     uint16_t len = 0;
     ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof buf, &len);
     logEvent("ЗАПИСЬ от RD -> 0x%04x: %s\n", attr, hex(buf, len).c_str());
+    if (attr == hRdWrite && len == 20) ackPending = true;
     return 0;
   }
   return BLE_ATT_ERR_READ_NOT_PERMITTED;
@@ -220,6 +226,8 @@ int gapEvent(ble_gap_event *ev, void *arg) {
       logEvent("Отключился, причина 0x%03x\n", ev->disconnect.reason);
       connHandle = BLE_HS_CONN_HANDLE_NONE;
       subscribers = 0;
+      connectedAt = 0;
+      paramsRequested = false;
       startAdv(); // настоящий под снова рекламируется сразу после разрыва
       break;
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -624,13 +632,26 @@ void loop() {
       buf += c;
     }
   }
-  // TX-под шлёт статус-кадр раз в секунду, RD должен на него отвечать.
   pollButton(buttonUp);
   pollButton(buttonDown);
   pollFineSwitch();
   updateLed();
-  if (!isOX() && rdConnected() && millis() - lastStatus > 1000) {
-    lastStatus = millis();
-    sendCode(STATUS_FRAME, true);
+  if (ackPending) {
+    ackPending = false;
+    static const uint8_t none = 0;
+    sendFrame(&none, 0, true);
+    logEvent("Ответ RD: пустой notify\n");
+  }
+  // Связь могла появиться и без CONNECT (статус 26), поэтому время подключения ставим здесь
+  if (rdConnected() && connectedAt == 0) connectedAt = millis();
+  if (rdConnected() && !paramsRequested && millis() - connectedAt > 1700) {
+    paramsRequested = true;
+    ble_gap_upd_params p = {};
+    p.itvl_min = 32;               // 40 мс
+    p.itvl_max = 64;               // 80 мс
+    p.latency = 4;
+    p.supervision_timeout = 200;   // 2 с
+    int rc = ble_gap_update_params(connHandle, &p);
+    logEvent("Запрос параметров 40–80 мс, latency 4: %d\n", rc);
   }
 }

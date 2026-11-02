@@ -8,3 +8,5 @@ mac/wheeltop-shifter
 # Настройки Obsidian и macOS
 .obsidian/
 .DS_Store
+dongle/sniffer/build/
+__pycache__/
