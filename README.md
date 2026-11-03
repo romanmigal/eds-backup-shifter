@@ -1,4 +1,4 @@
-# wheeltop
+# eds-backup-shifter
 
 Shift a WHEELTOP EDS electronic rear derailleur with your own buttons: an ESP32 board connects to the derailleur over Bluetooth LE the way the Wheeltop phone app does, so the stock shifter keeps working too.
 
