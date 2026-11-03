@@ -3,7 +3,7 @@
 Shift a WHEELTOP EDS electronic rear derailleur with your own buttons: an ESP32 board connects to the
 derailleur over Bluetooth LE the way the Wheeltop phone app does, so the stock shifter keeps working too.
 
-Not affiliated with Wheeltop. The protocol was reverse-engineered; use at your own risk.
+An unofficial project, not affiliated with or endorsed by WHEELTOP. See [Disclaimer](#disclaimer).
 
 ## Quick start
 
@@ -28,3 +28,20 @@ and switches its mode.
 | [dongle/](dongle/), [SNIFFER.md](SNIFFER.md) | BLE sniffer firmware for the nRF52840 Dongle that follows CSA #2 connections |
 
 Tested with an EDS OX2 rear derailleur and a TX Right shifter.
+
+## Disclaimer
+
+This is an independent, unofficial project. It is not affiliated with, endorsed by or supported by WHEELTOP.
+"WHEELTOP", "EDS" and the product names are used only to say which devices this works with; they belong to
+their owners.
+
+The protocol was worked out for interoperability by recording the Bluetooth traffic between devices the author
+owns. The repository contains no code, firmware or other material from WHEELTOP.
+
+Use it at your own risk. A derailleur that shifts unexpectedly can cause a crash, so test on a stand before
+riding. Using this with your derailleur may affect its warranty: WHEELTOP's warranty excludes products that
+have been modified or misused.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
