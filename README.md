@@ -1,9 +1,14 @@
 # wheeltop
 
-Shift a WHEELTOP EDS electronic rear derailleur with your own buttons: an ESP32 board connects to the
-derailleur over Bluetooth LE the way the Wheeltop phone app does, so the stock shifter keeps working too.
+Shift a WHEELTOP EDS electronic rear derailleur with your own buttons: an ESP32 board connects to the derailleur over Bluetooth LE the way the Wheeltop phone app does, so the stock shifter keeps working too.
 
 An unofficial project, not affiliated with or endorsed by WHEELTOP. See [Disclaimer](#disclaimer).
+
+## Why
+
+I was on a bikepacking trip in Karelia, in the north-west of Russia, with a WHEELTOP EDS OX 2.0 rear derailleur. The derailleur worked flawlessly for the whole 900 km route, but the shifter didn't: after a few days of constant heavy rain, water got inside it and it stopped working, so I could no longer change gear. The backup plan, shifting from the Wheeltop phone app, turned out to need an internet connection, and there was none that far from civilisation.
+
+So this project: a backup shifter you can build yourself and an app that shifts from the phone with no internet.
 
 ## Quick start
 
